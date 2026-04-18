@@ -1,0 +1,95 @@
+Ubuntu Host SOP (No Docker First, Docker Later)
+===============================================
+
+Goal
+----
+Run the static analysis + harness generation + host fuzzing workflow directly on Ubuntu first.
+After this is stable, move to Docker for reproducibility.
+
+
+A) One-time host setup (Ubuntu)
+-------------------------------
+Run from repository root:
+
+  sudo apt update
+  sudo apt install -y python3 python3-pip g++ openjdk-17-jdk unzip wget
+  pip3 install -r requirements.txt --break-system-packages || pip3 install -r requirements.txt
+
+Set JAVA_HOME (needed for JNI headers):
+
+  export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+  echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> ~/.bashrc
+
+
+B) APK layout requirements
+--------------------------
+For each app listed in apks.txt, ensure this exists:
+
+  target_APK/<APPNAME>/base.apk
+
+Quick validation command:
+
+  while read -r a; do [ -n "$a" ] && ls "target_APK/$a/base.apk"; done < apks.txt
+
+
+C) Run end-to-end on host
+-------------------------
+Option 1 (recommended one-shot):
+
+  MAX_APPS=3 FUZZ_TIME=120 ./run_ubuntu_experiment.sh
+
+Option 2 (step-by-step):
+
+  ./run-static-pipeline.sh
+  python3 tools/print_seed_constraints.py --json-out results/seed_constraints_summary.json
+  ./run_host_fuzz.sh <APPNAME> <HARNESS_NAME> 180
+
+
+D) Where to check results
+-------------------------
+Experiment logs:
+
+  results/ubuntu_experiment_<timestamp>/logs/
+
+Seed constraint summary:
+
+  results/ubuntu_experiment_<timestamp>/seed_constraints_summary.json
+
+Per-harness fuzz outputs:
+
+  target_APK/<APP>/fuzzing_output_host/<HARNESS>/output_host_<timestamp>/summary.json
+
+In summary.json, check:
+  - executions
+  - crashes
+  - mutation_mode
+  - seed_parse_success_rate
+
+
+E) Common issues and fixes
+--------------------------
+1) No harness selected / no entries in fuzz.db
+   - Static pipeline failed earlier.
+   - Inspect:
+       results/.../logs/static_pipeline.log
+
+2) Runtime libs missing (libart.so / libandroid_runtime.so)
+   - Check HOST_RUNTIME_HINT.txt in the output directory.
+
+3) Harness compile failures
+   - Verify:
+       g++ --version
+       echo $JAVA_HOME
+   - Verify JNI include paths exist:
+       $JAVA_HOME/include
+       $JAVA_HOME/include/linux
+
+
+F) Move to Docker later
+-----------------------
+After host workflow is stable:
+  1) Freeze versions (python/java/g++/pip deps)
+  2) Mirror those versions in Dockerfile
+  3) Re-run same commands in container
+  4) Use Docker runs for final reproducible experiment numbers
+
