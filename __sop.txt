@@ -1,0 +1,239 @@
+SoFuzz SOP (Ubuntu CLI only)
+============================
+
+Prerequisites
+-------------
+- Ubuntu machine with terminal access.
+- Docker installed and usable (or run commands with sudo).
+- Project cloned at ~/sofuzz.
+
+1) Initial setup (one-time)
+---------------------------
+cd ~/sofuzz
+chmod +x setup.sh run.sh run-static-pipeline.sh run_ubuntu_experiment.sh run_host_fuzz.sh
+./setup.sh
+
+What setup.sh does:
+- Downloads target_APK.tar.gz (large file).
+- Extracts target_APK/ dataset.
+- Builds Docker image: sofuzz.
+
+2) Start container
+------------------
+cd ~/sofuzz
+./run.sh
+
+You should now be inside container shell at /mnt.
+
+3) Prepare app list
+-------------------
+# Use top list directly:
+cp __top1000_apks.txt apks.txt
+
+# OR quick test with first app only:
+head -n 1 __top1000_apks.txt > apks.txt
+
+4) Test one application (copy-paste)
+------------------------------------
+# Pick first app from list and run pipeline for only that app:
+head -n 1 __top1000_apks.txt > apks.txt && ./run-static-pipeline.sh
+
+# Select one harness for that app and fuzz for 300 seconds:
+APP=$(head -n 1 apks.txt)
+HARNESS=$(python3 - <<'PY'
+import os, sqlite3
+app = open("apks.txt").read().strip().splitlines()[0]
+con = sqlite3.connect("fuzzing/fuzz.db")
+row = con.execute("SELECT fname FROM fuzzdata WHERE app = ? ORDER BY fname LIMIT 1", (app,)).fetchone()
+con.close()
+print(row[0] if row else "")
+PY
+)
+echo "APP=$APP"
+echo "HARNESS=$HARNESS"
+./run_host_fuzz.sh "$APP" "$HARNESS" 300
+
+5) Run static pipeline
+----------------------
+./run-static-pipeline.sh
+
+What it does:
+- Reads app names from apks.txt.
+- Runs static analysis passes.
+- Generates harnesses.
+- Builds fuzz queue database at fuzzing/fuzz.db.
+
+6) Run one-shot Ubuntu experiment
+---------------------------------
+./run_ubuntu_experiment.sh
+
+Optional overrides:
+APKS_FILE=$(pwd)/apks.txt MAX_APPS=5 FUZZ_TIME=180 ./run_ubuntu_experiment.sh
+
+7) Check outputs
+----------------
+# Latest experiment folder:
+ls -td results/ubuntu_experiment_* | head -n 1
+
+# Logs:
+LATEST=$(ls -td results/ubuntu_experiment_* | head -n 1)
+ls "$LATEST/logs"
+
+# Seed constraints summary:
+ls "$LATEST/seed_constraints_summary.json"
+
+8) Run host fuzzing manually (single target)
+--------------------------------------------
+# Get one app+harness from DB:
+python3 - <<'PY'
+import sqlite3
+con = sqlite3.connect("fuzzing/fuzz.db")
+row = con.execute("SELECT app, fname FROM fuzzdata LIMIT 1").fetchone()
+print(row[0], row[1])
+con.close()
+PY
+
+# Run fuzzing:
+./run_host_fuzz.sh <APPNAME> "<HARNESS_NAME>" 300
+
+9) Typical folder expectations
+------------------------------
+- Input APK path:
+  target_APK/<APPNAME>/base.apk
+- Native libs may be under:
+  target_APK/<APPNAME>/lib/arm64-v8a/*.so
+
+10) Common issues and quick fixes
+---------------------------------
+- "apks.txt not found":
+  Create it in /mnt (repo root inside container).
+
+- "missing base.apk":
+  Ensure each app in apks.txt has target_APK/<APPNAME>/base.apk.
+
+- Docker permission denied:
+  Use sudo for setup/run, or ask admin to add your user to docker group.
+
+- Network/download failures:
+  Retry setup.sh (Zenodo/SDK downloads may be blocked by network policy).
+
+- Very slow run:
+  Start with 1 app:
+  head -n 1 __top1000_apks.txt > apks.txt
+  ./run-static-pipeline.sh
+
+11) Minimal daily workflow
+--------------------------
+cd ~/sofuzz
+./run.sh
+cp __top1000_apks.txt apks.txt
+./run-static-pipeline.sh
+./run_ubuntu_experiment.sh
+
+12) Deep internal flow (APK -> harness -> call graph -> fuzz queue)
+--------------------------------------------------------------------
+Use this section when you want to understand each internal stage.
+
+A) End-to-end deep flow chart
+-----------------------------
+[INPUT LIST]
+  apks.txt
+     |
+     v
+[FOR EACH APP in apks.txt]
+  target_APK/<APP>/base.apk must exist
+     |
+     +--> Stage 1: Native signature extraction
+     |      Command path used by pipeline:
+     |      python3 static_analysis/preprocess.py --target <APP> --signatures --static_only
+     |         -> internally runs: static_analysis/NativeSignatures/analyze_native_signatures.sh <APP>
+     |         -> extracts lib folder from base.apk when available
+     |         -> writes: target_APK/<APP>/signatures_pattern.txt
+     |
+     +--> Stage 2: Argument analysis
+     |      Command path used by pipeline:
+     |      python3 static_analysis/preprocess.py --target <APP> --argument_analysis --static_only
+     |         -> writes: target_APK/<APP>/static_analysis/simple_argument_constraints.txt
+     |
+     +--> Stage 3: Call-sequence / call-graph style static pass
+     |      Command path used by pipeline:
+     |      python3 static_analysis/preprocess.py --target <APP> --callsequence_analysis --static_only
+     |         -> writes: target_APK/<APP>/static_analysis/CS_<APP>.json
+     |         -> this JSON represents discovered static call sequence relations
+     |
+     +--> Stage 4: Harness generation (4 strategy passes)
+     |      Invoked through generate_harnesses_batch.py with different HARNESS_GEN_FLAGS
+     |         -> writes folders under: target_APK/<APP>/harnesses/
+     |         -> each harness folder contains harness.cpp / harness_debug.cpp / seeds/
+     |
+     +--> Stage 5: Build fuzz queue database
+            Command path used by pipeline:
+            python3 build_fuzz_queue.py
+               -> scans harnesses and inserts (app, fname) into DB
+               -> final DB: fuzzing/fuzz.db
+
+[POST-PIPELINE]
+  Choose (app, harness) from fuzzing/fuzz.db
+     |
+     v
+  Run host fuzz:
+  ./run_host_fuzz.sh <APP> "<HARNESS>" 300
+     |
+     v
+  Outputs:
+  target_APK/<APP>/fuzzing_output_host/<HARNESS>/output_host_<timestamp>/
+
+B) Commands to inspect each internal artifact
+---------------------------------------------
+# 1) Pick one app for deep inspection
+APP=$(head -n 1 apks.txt)
+echo "$APP"
+
+# 2) Verify mandatory input APK
+ls "target_APK/$APP/base.apk"
+
+# 3) Verify signatures output
+ls "target_APK/$APP/signatures_pattern.txt"
+
+# 4) Verify argument constraints output
+ls "target_APK/$APP/static_analysis/simple_argument_constraints.txt"
+
+# 5) Verify call-sequence/call-graph JSON output
+ls "target_APK/$APP/static_analysis/CS_${APP}.json"
+
+# 6) Verify generated harnesses
+ls "target_APK/$APP/harnesses" | head
+
+# 7) Verify queue DB has entries for this app
+python3 - <<'PY'
+import sqlite3, os
+app = open("apks.txt").read().strip().splitlines()[0]
+con = sqlite3.connect("fuzzing/fuzz.db")
+cnt = con.execute("SELECT COUNT(*) FROM fuzzdata WHERE app = ?", (app,)).fetchone()[0]
+print("app:", app, "queue_entries:", cnt)
+row = con.execute("SELECT fname FROM fuzzdata WHERE app = ? ORDER BY fname LIMIT 1", (app,)).fetchone()
+print("sample_harness:", row[0] if row else "NONE")
+con.close()
+PY
+
+C) Per-app manual deep run (without full batch)
+-----------------------------------------------
+# Run each static stage manually for one app:
+APP=$(head -n 1 apks.txt)
+python3 static_analysis/preprocess.py --target "$APP" --signatures --static_only
+python3 static_analysis/preprocess.py --target "$APP" --argument_analysis --static_only
+python3 static_analysis/preprocess.py --target "$APP" --callsequence_analysis --static_only
+
+# Generate harnesses (same style as pipeline, one strategy example):
+python3 harness/harness_generator.py -jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -ct_argval -fuzz --afl_coverage_on --target "$APP"
+
+# Rebuild queue DB after harness generation:
+python3 build_fuzz_queue.py
+
+D) Understanding "call graph" in this project
+---------------------------------------------
+- The project's static call graph/call sequence result is stored as:
+  target_APK/<APP>/static_analysis/CS_<APP>.json
+- This file is produced by the callsequence analysis stage of preprocess.
+- Harness generation and queue building consume static outputs along with signatures/constraints.
+- In static-only mode, dynamic device offset extraction is skipped, but callsequence JSON is still generated.
