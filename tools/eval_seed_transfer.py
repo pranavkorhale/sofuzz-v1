@@ -30,7 +30,21 @@ def run_host_fuzz(app, harness, seconds, seed_source):
             f"host_fuzz failed for seed_source={seed_source}\n"
             f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
         )
-    summary = json.loads(proc.stdout)
+    summary = None
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    # host_fuzz may print log lines before JSON; parse from the end.
+    for i in range(len(lines)):
+        candidate = "\n".join(lines[i:])
+        try:
+            summary = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+    if summary is None:
+        raise RuntimeError(
+            "host_fuzz finished but JSON summary could not be parsed.\n"
+            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+        )
     return summary
 
 
