@@ -336,6 +336,40 @@ def classify_crash(returncode: int, stdout: str, stderr: str):
     return None
 
 
+def detect_runtime_dependency_error(stderr: str):
+    if "libart.so" in stderr and "cannot open shared object file" in stderr:
+        return "libart.so"
+    if "libandroid_runtime.so" in stderr and "cannot open shared object file" in stderr:
+        return "libandroid_runtime.so"
+    return None
+
+
+def preflight_runtime_check(harness_bin: Path, harness_dir: Path, env: dict, seed_data):
+    """
+    Execute one quick run and fail fast if host runtime dependencies are missing.
+    This avoids counting setup failures as fuzzing crashes.
+    """
+    with tempfile.TemporaryDirectory(prefix="host_fuzz_preflight_") as tmp_dir:
+        tmp_input = Path(tmp_dir) / "input.bin"
+        tmp_input.write_bytes(seed_data[0] if seed_data else b"\x00")
+        cmd = [str(harness_bin), str(tmp_input), "0", "0"]
+        proc = subprocess.run(
+            cmd,
+            cwd=harness_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    missing = detect_runtime_dependency_error(proc.stderr)
+    if missing is not None:
+        raise RuntimeError(
+            "Host runtime dependency missing: "
+            f"{missing}. Provide Android runtime libs in LD_LIBRARY_PATH "
+            "(e.g. mount/copy libart.so and libandroid_runtime.so) and retry."
+        )
+
+
 def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild: bool, seed_source: str):
     app_dir = TARGET_APK_PATH / app
     harness_dir = app_dir / "harnesses" / harness_name
@@ -378,6 +412,8 @@ def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild:
         env["LD_LIBRARY_PATH"] = f"{harness_lib_path}:{lib_path}:{env['LD_LIBRARY_PATH']}"
     else:
         env["LD_LIBRARY_PATH"] = f"{harness_lib_path}:{lib_path}"
+
+    preflight_runtime_check(harness_bin=harness_bin, harness_dir=harness_dir, env=env, seed_data=seed_data)
 
     start = time.time()
     total = 0
