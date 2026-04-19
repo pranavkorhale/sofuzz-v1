@@ -134,6 +134,32 @@ def load_seed_constraints(harness_dir: Path):
         return None
 
 
+def load_seed_inputs(harness_dir: Path, seed_source: str):
+    seeds_dir = harness_dir / "seeds"
+    transfer_dir = harness_dir / "seeds_transfer"
+
+    local_files = sorted([p for p in seeds_dir.glob("*") if p.is_file()]) if seeds_dir.exists() else []
+    transfer_files = sorted([p for p in transfer_dir.glob("*") if p.is_file()]) if transfer_dir.exists() else []
+
+    if seed_source == "local":
+        selected = local_files
+    elif seed_source == "transfer":
+        selected = transfer_files
+    else:
+        selected = local_files + transfer_files
+
+    seed_data = [p.read_bytes() for p in selected]
+    if len(seed_data) == 0:
+        # fallback seed so runner can start even if seed generation was skipped
+        seed_data = [b"\x00"]
+
+    return seed_data, {
+        "local_seed_files": len(local_files),
+        "transfer_seed_files": len(transfer_files),
+        "selected_seed_files": len(selected),
+    }
+
+
 def mutate_input(data: bytes, max_size: int = MAX_MUTATED_INPUT_SIZE):
     if len(data) == 0:
         data = b"\x00"
@@ -309,7 +335,7 @@ def classify_crash(returncode: int, stdout: str, stderr: str):
     return None
 
 
-def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild: bool):
+def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild: bool, seed_source: str):
     app_dir = TARGET_APK_PATH / app
     harness_dir = app_dir / "harnesses" / harness_name
     if not harness_dir.exists():
@@ -328,15 +354,7 @@ def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild:
 
     seed_constraints = load_seed_constraints(harness_dir)
 
-    seeds_dir = harness_dir / "seeds"
-    seed_files = sorted(list(seeds_dir.glob("*"))) if seeds_dir.exists() else []
-    if not seed_files:
-        # fallback seed so runner can start even if seed generation was skipped
-        seed_data = [b"\x00"]
-    else:
-        seed_data = [p.read_bytes() for p in seed_files if p.is_file()]
-        if len(seed_data) == 0:
-            seed_data = [b"\x00"]
+    seed_data, seed_stats = load_seed_inputs(harness_dir, seed_source=seed_source)
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_dir = app_dir / "fuzzing_output_host" / harness_name / f"output_host_{timestamp}"
@@ -436,6 +454,8 @@ def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild:
         "output_dir": str(out_dir),
         "target_library": target_library,
         "target_class": target_class,
+        "seed_source": seed_source,
+        "seed_stats": seed_stats,
         "mutation_mode": "structured" if seed_constraints is not None else "byte",
         "structured_mutations": structured_mutations,
         "seed_parse_attempts": parse_attempts,
@@ -453,6 +473,12 @@ def main():
     parser.add_argument("-t", "--time", type=int, default=300, help="fuzz time in seconds")
     parser.add_argument("--timeout", type=int, default=3, help="per-execution timeout in seconds")
     parser.add_argument("--rebuild", action="store_true", help="force rebuild harness binary")
+    parser.add_argument(
+        "--seed-source",
+        choices=["local", "transfer", "local+transfer"],
+        default="local",
+        help="Seed source to use: local seeds, transfer seeds, or both (default: local)",
+    )
     args = parser.parse_args()
 
     random.seed()
@@ -462,6 +488,7 @@ def main():
         duration=args.time,
         timeout=args.timeout,
         rebuild=args.rebuild,
+        seed_source=args.seed_source,
     )
     print(json.dumps(summary, indent=2))
 
