@@ -370,7 +370,15 @@ def preflight_runtime_check(harness_bin: Path, harness_dir: Path, env: dict, see
         )
 
 
-def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild: bool, seed_source: str):
+def fuzz_host(
+    app: str,
+    harness_name: str,
+    duration: int,
+    timeout: int,
+    rebuild: bool,
+    seed_source: str,
+    skip_preflight: bool = False,
+):
     app_dir = TARGET_APK_PATH / app
     harness_dir = app_dir / "harnesses" / harness_name
     if not harness_dir.exists():
@@ -413,7 +421,10 @@ def fuzz_host(app: str, harness_name: str, duration: int, timeout: int, rebuild:
     else:
         env["LD_LIBRARY_PATH"] = f"{harness_lib_path}:{lib_path}"
 
-    preflight_runtime_check(harness_bin=harness_bin, harness_dir=harness_dir, env=env, seed_data=seed_data)
+    if not skip_preflight:
+        preflight_runtime_check(harness_bin=harness_bin, harness_dir=harness_dir, env=env, seed_data=seed_data)
+    else:
+        print("[HOST-FUZZ] WARNING: --skip-preflight set; runtime crashes may be environment-induced", file=sys.stderr)
 
     start = time.time()
     total = 0
@@ -516,6 +527,11 @@ def main():
         default="local",
         help="Seed source to use: local seeds, transfer seeds, or both (default: local)",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip runtime dependency preflight (degraded mode: env-induced crashes possible)",
+    )
     args = parser.parse_args()
 
     random.seed()
@@ -526,6 +542,7 @@ def main():
         timeout=args.timeout,
         rebuild=args.rebuild,
         seed_source=args.seed_source,
+        skip_preflight=args.skip_preflight,
     )
     print(json.dumps(summary, indent=2))
 

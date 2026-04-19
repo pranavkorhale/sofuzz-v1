@@ -79,7 +79,7 @@ def apply_naive_transfer(app, harness):
     run_subprocess(cmd, "apply_seed_transfer")
 
 
-def apply_coverage_guided_transfer(app, harness):
+def apply_coverage_guided_transfer(app, harness, skip_preflight=False):
     cmd = [
         "python3",
         str(COVERAGE_GUIDED_TOOL),
@@ -89,10 +89,12 @@ def apply_coverage_guided_transfer(app, harness):
         harness,
         "--clean",
     ]
+    if skip_preflight:
+        cmd.append("--skip-preflight")
     run_subprocess(cmd, "coverage_guided_transfer")
 
 
-def run_host_fuzz(app, harness, seconds, seed_source):
+def run_host_fuzz(app, harness, seconds, seed_source, skip_preflight=False):
     cmd = [
         "python3",
         str(HOST_FUZZ),
@@ -106,6 +108,8 @@ def run_host_fuzz(app, harness, seconds, seed_source):
         seed_source,
         "--rebuild",
     ]
+    if skip_preflight:
+        cmd.append("--skip-preflight")
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -115,7 +119,7 @@ def run_host_fuzz(app, harness, seconds, seed_source):
     return parse_json_from_stdout(proc.stdout, proc.stderr)
 
 
-def setup_method(method, app, harness):
+def setup_method(method, app, harness, skip_preflight=False):
     if method == "baseline":
         reset_transfer_dir(app, harness)
         return
@@ -123,7 +127,7 @@ def setup_method(method, app, harness):
         apply_naive_transfer(app, harness)
         return
     if method == "coverage_guided_transfer":
-        apply_coverage_guided_transfer(app, harness)
+        apply_coverage_guided_transfer(app, harness, skip_preflight=skip_preflight)
         return
     raise SystemExit(f"unknown method: {method}")
 
@@ -208,6 +212,11 @@ def main():
         default=str(REPO_ROOT / "results"),
         help="Output directory for comparison artifacts (default: results/)",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Forward --skip-preflight to host_fuzz and coverage-guided transfer (degraded mode)",
+    )
     args = parser.parse_args()
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
@@ -224,10 +233,12 @@ def main():
 
     for method in methods:
         print(f"[EVAL] setting up method={method}")
-        setup_method(method, args.app, args.harness)
+        setup_method(method, args.app, args.harness, skip_preflight=args.skip_preflight)
         seed_source = METHOD_DEFS[method]["seed_source"]
         print(f"[EVAL] running method={method} seed_source={seed_source}")
-        summary = run_host_fuzz(args.app, args.harness, args.time, seed_source)
+        summary = run_host_fuzz(
+            args.app, args.harness, args.time, seed_source, skip_preflight=args.skip_preflight
+        )
         summaries[method] = summary
         rows.append(flatten_summary(run_id, args.app, args.harness, method, summary))
         output_dirs.append(summary.get("output_dir"))

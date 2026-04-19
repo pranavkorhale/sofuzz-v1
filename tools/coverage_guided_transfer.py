@@ -200,6 +200,11 @@ def main():
         default=str(DEFAULT_OUT_DIR),
         help="Where to write run-level summary JSON (default: results/)",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip Android runtime dependency check (degraded probing).",
+    )
     args = parser.parse_args()
 
     pool_path = Path(args.pool).resolve()
@@ -244,10 +249,11 @@ def main():
             timeout=args.probe_timeout,
         )
         missing = detect_runtime_dependency_error(result["stderr"])
-        if missing:
+        if missing and not args.skip_preflight:
             raise SystemExit(
                 f"Host runtime dependency missing: {missing}. "
-                "Provide Android runtime libs in LD_LIBRARY_PATH and retry."
+                "Provide Android runtime libs in LD_LIBRARY_PATH and retry, "
+                "or pass --skip-preflight for degraded probing."
             )
         fp = fingerprint(
             returncode=result["returncode"],
