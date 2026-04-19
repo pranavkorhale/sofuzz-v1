@@ -104,6 +104,7 @@ def compile_harness(harness_dir: Path):
         "-Wl,--export-dynamic",
         "-Wl,-rpath,$ORIGIN",
         *jni_flags,
+        f"-I{HARNESS_CPP_DIR}",
         str(harness_src),
         "-L.",
         "-lharness",
