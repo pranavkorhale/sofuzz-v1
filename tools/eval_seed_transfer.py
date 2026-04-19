@@ -8,6 +8,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FUZZ = REPO_ROOT / "fuzzing" / "host_fuzz.py"
+TRIAGE_TOOL = REPO_ROOT / "tools" / "triage_host_crashes.py"
 
 
 def run_host_fuzz(app, harness, seconds, seed_source):
@@ -80,6 +81,28 @@ def write_csv(rows, out_csv):
         writer.writerows(rows)
 
 
+def run_triage(output_dirs, out_dir, run_id):
+    cmd = ["python3", str(TRIAGE_TOOL)]
+    for output_dir in output_dirs:
+        cmd.extend(["--input-dir", output_dir])
+    cmd.extend(
+        [
+            "--out-dir",
+            str(out_dir),
+            "--out-prefix",
+            f"seed_transfer_triage_{run_id}",
+        ]
+    )
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(
+            "[EVAL] triage failed (continuing):\n"
+            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+        )
+        return
+    print(proc.stdout.strip())
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run baseline vs transfer host fuzz and write comparison outputs."
@@ -115,6 +138,11 @@ def main():
     json_path = out_dir / f"seed_transfer_eval_{run_id}.json"
     write_csv(rows, csv_path)
     json_path.write_text(json.dumps({"rows": rows}, indent=2))
+    run_triage(
+        output_dirs=[baseline.get("output_dir"), transfer.get("output_dir")],
+        out_dir=out_dir,
+        run_id=run_id,
+    )
 
     print(f"[EVAL] wrote CSV: {csv_path}")
     print(f"[EVAL] wrote JSON: {json_path}")

@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FUZZ = REPO_ROOT / "fuzzing" / "host_fuzz.py"
 DEFAULT_DB = REPO_ROOT / "fuzzing" / "fuzz.db"
+TRIAGE_TOOL = REPO_ROOT / "tools" / "triage_host_crashes.py"
 
 
 def run_host_fuzz(app, harness, seconds, seed_source):
@@ -105,6 +106,31 @@ def aggregate(rows, strategy, phase):
         "total_crashes": sum(int(r["crashes"] or 0) for r in chosen),
         "total_executions": sum(int(r["executions"] or 0) for r in chosen),
     }
+
+
+def run_triage(rows, out_dir, run_id):
+    output_dirs = [r["output_dir"] for r in rows if r["phase"] == "full" and r.get("output_dir")]
+    if not output_dirs:
+        return
+    cmd = ["python3", str(TRIAGE_TOOL)]
+    for output_dir in output_dirs:
+        cmd.extend(["--input-dir", output_dir])
+    cmd.extend(
+        [
+            "--out-dir",
+            str(out_dir),
+            "--out-prefix",
+            f"adaptive_budget_triage_{run_id}",
+        ]
+    )
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(
+            "[ADAPTIVE] triage failed (continuing):\n"
+            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+        )
+        return
+    print(proc.stdout.strip())
 
 
 def main():
@@ -244,6 +270,7 @@ def main():
     json_path = out_dir / f"adaptive_budget_eval_{run_id}.json"
     write_csv(rows, csv_path)
     json_path.write_text(json.dumps({"summary": summary, "rows": rows}, indent=2))
+    run_triage(rows=rows, out_dir=out_dir, run_id=run_id)
 
     print(f"[ADAPTIVE] wrote CSV: {csv_path}")
     print(f"[ADAPTIVE] wrote JSON: {json_path}")
