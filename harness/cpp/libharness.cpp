@@ -99,8 +99,8 @@ void load_art()
 	//std::string apk_path = "-Djava.class.path=" + targetAppPath;
 	std::string lib_path = "-Djava.library.path=" + targetAppPath + "/lib/arm64-v8a";
     JavaVMOption opt[] = {
-    	{ apk_path.c_str(), nullptr},
-        { lib_path.c_str(), nullptr}
+    	{ const_cast<char*>(apk_path.c_str()), nullptr},
+        { const_cast<char*>(lib_path.c_str()), nullptr}
     };
 
 
