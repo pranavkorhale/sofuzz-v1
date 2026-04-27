@@ -13,7 +13,7 @@ DEFAULT_DB = REPO_ROOT / "fuzzing" / "fuzz.db"
 TRIAGE_TOOL = REPO_ROOT / "tools" / "triage_host_crashes.py"
 
 
-def run_host_fuzz(app, harness, seconds, seed_source):
+def run_host_fuzz(app, harness, seconds, seed_source, skip_preflight=False):
     cmd = [
         "python3",
         str(HOST_FUZZ),
@@ -27,6 +27,8 @@ def run_host_fuzz(app, harness, seconds, seed_source):
         seed_source,
         "--rebuild",
     ]
+    if skip_preflight:
+        cmd.append("--skip-preflight")
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -181,6 +183,11 @@ def main():
         default=str(REPO_ROOT / "results"),
         help="Output directory for CSV/JSON artifacts",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Forward --skip-preflight to host_fuzz (degraded mode).",
+    )
     args = parser.parse_args()
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -196,7 +203,13 @@ def main():
     pilot_scores = []
     for idx, harness in enumerate(harnesses):
         print(f"[ADAPTIVE] pilot {idx + 1}/{len(harnesses)} harness={harness}")
-        summary = run_host_fuzz(args.app, harness, args.pilot_time, args.seed_source)
+        summary = run_host_fuzz(
+            args.app,
+            harness,
+            args.pilot_time,
+            args.seed_source,
+            skip_preflight=args.skip_preflight,
+        )
         score = score_summary(summary)
         pilot_scores.append((harness, score, summary))
         rows.append(
@@ -221,7 +234,13 @@ def main():
 
     for rank, harness in enumerate(baseline_selected, start=1):
         print(f"[ADAPTIVE] baseline full rank={rank} harness={harness}")
-        summary = run_host_fuzz(args.app, harness, args.full_time, args.seed_source)
+        summary = run_host_fuzz(
+            args.app,
+            harness,
+            args.full_time,
+            args.seed_source,
+            skip_preflight=args.skip_preflight,
+        )
         rows.append(
             flatten_row(
                 run_id=run_id,
@@ -238,7 +257,13 @@ def main():
     pilot_score_map = {harness: score for harness, score, _ in ranked}
     for rank, harness in enumerate(adaptive_selected, start=1):
         print(f"[ADAPTIVE] adaptive full rank={rank} harness={harness}")
-        summary = run_host_fuzz(args.app, harness, args.full_time, args.seed_source)
+        summary = run_host_fuzz(
+            args.app,
+            harness,
+            args.full_time,
+            args.seed_source,
+            skip_preflight=args.skip_preflight,
+        )
         rows.append(
             flatten_row(
                 run_id=run_id,
