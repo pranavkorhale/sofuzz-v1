@@ -1,95 +1,357 @@
-Ubuntu Host SOP (No Docker First, Docker Later)
-===============================================
+SoFuzz — Standard Operating Procedure (SOP)
+===========================================
 
-Goal
-----
-Run the static analysis + harness generation + host fuzzing workflow directly on Ubuntu first.
-After this is stable, move to Docker for reproducibility.
+Audience: Ubuntu CLI user.
+Goal: take APKs -> static analysis -> harnesses -> seed pool -> fuzzing
+      -> seed transfer (naive + coverage-guided) -> adaptive scheduling
+      -> crash triage. With clear knobs and meanings.
 
-
-A) One-time host setup (Ubuntu)
--------------------------------
-Run from repository root:
-
-  sudo apt update
-  sudo apt install -y python3 python3-pip g++ openjdk-17-jdk unzip wget
-  pip3 install -r requirements.txt --break-system-packages || pip3 install -r requirements.txt
-
-Set JAVA_HOME (needed for JNI headers):
-
-  export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-  echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> ~/.bashrc
+Conventions
+-----------
+- Repo root on host: ~/sofuzz-v1 (or wherever you cloned it).
+- Inside Docker container the same repo is mounted at /mnt.
+- Commands tagged [HOST] run on the VM/host shell.
+- Commands tagged [CONTAINER] run inside the docker container.
+- Variables to fill: <APP>, <HARNESS>.
+- Harness names contain '$', always single-quote them: 'Java_J_N_M$1c3w6w@@0'.
 
 
-B) APK layout requirements
---------------------------
-For each app listed in apks.txt, ensure this exists:
-
-  target_APK/<APPNAME>/base.apk
-
-Quick validation command:
-
-  while read -r a; do [ -n "$a" ] && ls "target_APK/$a/base.apk"; done < apks.txt
+0) One-time setup
+-----------------
+[HOST]
+  cd ~/sofuzz-v1
+  chmod +x setup.sh run.sh run-static-pipeline.sh run_ubuntu_experiment.sh run_host_fuzz.sh
+  ./setup.sh                       # downloads dataset + builds docker image (slow, one time)
 
 
-C) Run end-to-end on host
--------------------------
-Option 1 (recommended one-shot):
+1) Enter the container
+----------------------
+[HOST]
+  cd ~/sofuzz-v1
+  sudo ./run.sh                    # opens shell at /mnt inside container
 
-  MAX_APPS=3 FUZZ_TIME=120 ./run_ubuntu_experiment.sh
 
-Option 2 (step-by-step):
+2) Pick which apps to process
+-----------------------------
+[CONTAINER]
+  cp __top1000_apks.txt apks.txt              # all apps
+  # or quick test mode:
+  head -n 2 __top1000_apks.txt > apks.txt     # only first 2 apps
 
+
+3) Static pipeline (per app)
+----------------------------
+What it does for each app in apks.txt:
+  Stage 1: Native signature extraction
+    -> target_APK/<APP>/signatures_pattern.txt
+  Stage 2: Argument analysis (FlowDroid)
+    -> target_APK/<APP>/static_analysis/simple_argument_constraints.txt
+  Stage 3: Call-sequence analysis
+    -> target_APK/<APP>/static_analysis/CS_<APP>.json
+  Stage 4: Harness generation (multiple strategy variants)
+    -> target_APK/<APP>/harnesses/<HARNESS>/{harness.cpp,harness_debug.cpp,seeds/,info.json,seed_constraints.json}
+  Stage 5: Build fuzz queue DB
+    -> fuzzing/fuzz.db   (table fuzzdata: app, fname)
+
+Run:
+[CONTAINER]
   ./run-static-pipeline.sh
-  python3 tools/print_seed_constraints.py --json-out results/seed_constraints_summary.json
-  ./run_host_fuzz.sh <APPNAME> <HARNESS_NAME> 180
+
+Verify a single app:
+[CONTAINER]
+  APP=$(head -n 1 apks.txt)
+  ls "target_APK/$APP/base.apk"
+  ls "target_APK/$APP/signatures_pattern.txt"
+  ls "target_APK/$APP/static_analysis/simple_argument_constraints.txt"
+  ls "target_APK/$APP/static_analysis/CS_${APP}.json"
+  ls "target_APK/$APP/harnesses" | head
 
 
-D) Where to check results
--------------------------
-Experiment logs:
+4) Inspect the fuzz queue DB
+----------------------------
+[CONTAINER]
+  python3 - <<'PY'
+  import sqlite3
+  con = sqlite3.connect("fuzzing/fuzz.db")
+  for row in con.execute("SELECT app, fname FROM fuzzdata LIMIT 5"):
+      print(row)
+  PY
 
-  results/ubuntu_experiment_<timestamp>/logs/
-
-Seed constraint summary:
-
-  results/ubuntu_experiment_<timestamp>/seed_constraints_summary.json
-
-Per-harness fuzz outputs:
-
-  target_APK/<APP>/fuzzing_output_host/<HARNESS>/output_host_<timestamp>/summary.json
-
-In summary.json, check:
-  - executions
-  - crashes
-  - mutation_mode
-  - seed_parse_success_rate
+Pick one (APP, HARNESS) for testing.
 
 
-E) Common issues and fixes
---------------------------
-1) No harness selected / no entries in fuzz.db
-   - Static pipeline failed earlier.
-   - Inspect:
-       results/.../logs/static_pipeline.log
+5) Build the cross-app SEED POOL  (Novelty 1 prep)
+--------------------------------------------------
+What it does:
+- Scans all generated harnesses.
+- Builds a key per harness: ret_type|arg_types  (the JNI signature key).
+- Groups harnesses by key so seeds can be reused across apps.
+- Writes results/seed_pool.json (database for seed transfer).
 
-2) Runtime libs missing (libart.so / libandroid_runtime.so)
-   - Check HOST_RUNTIME_HINT.txt in the output directory.
+[CONTAINER]
+  python3 tools/build_seed_pool.py
+  ls results/seed_pool.json
+  python3 -c "import json; d=json.load(open('results/seed_pool.json')); \
+    print('keys=',d['count_keys'],'harnesses=',d['count_harnesses'])"
 
-3) Harness compile failures
-   - Verify:
-       g++ --version
-       echo $JAVA_HOME
-   - Verify JNI include paths exist:
-       $JAVA_HOME/include
-       $JAVA_HOME/include/linux
+Knobs:
+  --target-apk PATH   default: target_APK
+  --out PATH          default: results/seed_pool.json
+  --min-seeds N       skip harnesses with fewer than N local seeds (default 1)
 
 
-F) Move to Docker later
------------------------
-After host workflow is stable:
-  1) Freeze versions (python/java/g++/pip deps)
-  2) Mirror those versions in Dockerfile
-  3) Re-run same commands in container
-  4) Use Docker runs for final reproducible experiment numbers
+6) NAIVE Cross-App Seed Transfer  (Novelty 1 baseline)
+------------------------------------------------------
+What it does:
+- For each target harness, finds harnesses with the SAME signature key.
+- Copies their seeds into target's seeds_transfer/.
+- Pure structural matching (no behavior check).
 
+[CONTAINER]
+  python3 tools/apply_seed_transfer.py --app <APP> --harness '<HARNESS>' --clean
+
+Knobs:
+  --max-transfer N         max copied seeds per harness (default 20)
+  --allow-same-app         allow source seeds from same app
+  --clean                  wipe seeds_transfer/ before copying
+  --pool PATH              seed_pool.json path
+
+Outputs:
+  target_APK/<APP>/harnesses/<HARNESS>/seeds_transfer/*
+
+
+7) COVERAGE-GUIDED Seed Transfer  (Novelty 1 upgrade)
+-----------------------------------------------------
+What it does:
+- Probes each candidate seed once on the target harness.
+- Computes a behavior fingerprint per seed
+  (crash kind + stderr shape + length/duration buckets).
+- Accepts only seeds that show NEW behavior compared to local seeds
+  and already-accepted transferred seeds.
+- Drops duplicates -> smaller, denser, higher-utility seed set.
+
+[CONTAINER]
+  python3 tools/coverage_guided_transfer.py --app <APP> --harness '<HARNESS>' --clean
+
+Knobs:
+  --max-keep N             max accepted seeds (default 20)
+  --probe-timeout SEC      per-probe timeout (default 3)
+  --allow-same-app         allow same-app sources
+  --clean                  wipe seeds_transfer/ before populating
+  --skip-preflight         skip Android runtime preflight (degraded mode)
+
+Outputs:
+  target_APK/<APP>/harnesses/<HARNESS>/seeds_transfer/*
+  target_APK/<APP>/harnesses/<HARNESS>/seeds_transfer/_provenance.json
+  results/coverage_guided_transfer_<APP>_<HARNESS>_<run_id>.json
+
+
+8) Run a single host fuzz session
+---------------------------------
+[CONTAINER]
+  python3 fuzzing/host_fuzz.py \
+    --target <APP> \
+    --target_function '<HARNESS>' \
+    -t 60 \
+    --rebuild
+
+Knobs:
+  --seed-source local | transfer | local+transfer   (default: local)
+  --skip-preflight                                  (degraded mode if Android runtime libs missing)
+  --rebuild                                         force rebuild harness binary
+  -t SECONDS                                        fuzz time
+  --timeout SEC                                     per-execution timeout (default 3)
+
+Outputs:
+  target_APK/<APP>/fuzzing_output_host/<HARNESS>/output_host_<timestamp>/
+    summary.json
+    crashes/
+    queue/
+    logs/   (*.stderr.txt + *.stdout.txt per crash)
+
+Wrapper alternative:
+  ./run_host_fuzz.sh <APP> '<HARNESS>' 60 local+transfer
+
+
+9) THREE-WAY EVALUATION  (baseline / naive / coverage-guided)
+-------------------------------------------------------------
+What it does:
+- Runs three back-to-back fuzz sessions on the same harness.
+- Auto-applies the right transfer setup for each method.
+- Auto-runs crash triage across all three outputs.
+- Writes one comparison CSV + JSON.
+
+[CONTAINER]
+  python3 tools/eval_seed_transfer.py \
+    --app <APP> \
+    --harness '<HARNESS>' \
+    --time 60
+
+Knobs:
+  --methods csv      default: baseline,naive_transfer,coverage_guided_transfer
+                     methods: baseline | naive_transfer | coverage_guided_transfer
+  --time SEC         fuzz time per method (default 120)
+  --skip-preflight   degraded mode pass-through
+
+Outputs:
+  results/seed_transfer_eval_<run_id>.csv
+  results/seed_transfer_eval_<run_id>.json
+  results/seed_transfer_triage_<run_id>.csv
+  results/seed_transfer_triage_<run_id>.json
+
+
+10) ADAPTIVE TOP-K SCHEDULING  (Novelty 2)
+------------------------------------------
+What it does:
+- Pilots N candidate harnesses (short fuzz each).
+- Scores them (crashes dominate; execs and parser stability break ties).
+- Picks top-K best harnesses for full-budget runs.
+- Compares against baseline (queue-order) selection.
+- Auto-runs crash triage on full-run outputs.
+
+[CONTAINER]
+  python3 tools/adaptive_harness_scheduler.py \
+    --app <APP> \
+    --candidate-limit 10 \
+    --top-k 3 \
+    --pilot-time 20 \
+    --full-time 120
+
+Knobs:
+  --candidate-limit N    queue-order harnesses considered for pilot (default 10)
+  --top-k K              full-budget harnesses to compare (default 3)
+  --pilot-time SEC       short pilot per harness (default 20)
+  --full-time SEC        full budget per harness (default 120)
+  --seed-source MODE     local | transfer | local+transfer (default local+transfer)
+  --db PATH              fuzz queue DB (default fuzzing/fuzz.db)
+
+Outputs:
+  results/adaptive_budget_eval_<run_id>.csv
+  results/adaptive_budget_eval_<run_id>.json
+  results/adaptive_budget_triage_<run_id>.{csv,json}
+
+
+11) STANDALONE CRASH TRIAGE  (Novelty 3)
+----------------------------------------
+What it does:
+- Reads all stderr crash logs.
+- Normalizes addresses/long-numbers.
+- Clusters by signature into unique root causes.
+
+Triage one fuzz run:
+[CONTAINER]
+  python3 tools/triage_host_crashes.py \
+    --input-dir target_APK/<APP>/fuzzing_output_host/<HARNESS>/output_host_<TS>
+
+Triage all runs of one app:
+  python3 tools/triage_host_crashes.py --app <APP>
+
+Triage everything:
+  python3 tools/triage_host_crashes.py
+
+Knobs:
+  --input-dir DIR        repeatable (multiple runs)
+  --max-sig-lines N      stderr lines per signature (default 3)
+  --sample-per-cluster N samples saved per cluster (default 3)
+  --out-prefix NAME      output filename prefix
+  --out-dir DIR          output dir (default results/)
+
+Outputs:
+  results/<prefix>_<run_id>.csv
+  results/<prefix>_<run_id>.json
+
+
+12) Android runtime libs (real fuzzing)
+---------------------------------------
+By default host fuzzing needs Android runtime libs (libart.so etc.).
+Without them, every JNI execution aborts and triage shows ONE cluster
+"libart.so: cannot open shared object file".
+
+To enable real runtime (best effort, may still hit bionic-vs-glibc issues):
+
+[HOST]  (one time, populate libs from a redroid container)
+  cd ~/sofuzz-v1
+  sudo docker pull redroid/redroid:11.0.0-latest
+  sudo docker create --name pull_all redroid/redroid:11.0.0-latest >/dev/null
+  sudo docker export pull_all | tar -x -C /tmp \
+      system/apex/com.android.art.debug/lib64 \
+      system/apex/com.android.runtime/lib64/bionic \
+      system/lib64 system/lib64/bootstrap
+  sudo docker rm pull_all >/dev/null
+  mkdir -p android_runtime_libs
+  cp /tmp/system/apex/com.android.art.debug/lib64/*.so android_runtime_libs/ 2>/dev/null
+  cp -n /tmp/system/apex/com.android.runtime/lib64/bionic/*.so android_runtime_libs/ 2>/dev/null
+  cp -n /tmp/system/lib64/bootstrap/*.so android_runtime_libs/ 2>/dev/null
+  cp -n /tmp/system/lib64/*.so android_runtime_libs/ 2>/dev/null
+  sudo chown -R $USER:$USER android_runtime_libs
+
+[CONTAINER]
+  export LD_LIBRARY_PATH="/mnt/android_runtime_libs:${LD_LIBRARY_PATH}"
+
+If preflight still fails:
+  - Add the missing lib via docker export + cp into android_runtime_libs/.
+  - Or run with --skip-preflight (DEGRADED MODE).
+
+
+13) Degraded-mode runs (when libart isn't viable)
+-------------------------------------------------
+[CONTAINER]
+  python3 tools/eval_seed_transfer.py \
+    --app <APP> --harness '<HARNESS>' --time 60 --skip-preflight
+
+  python3 tools/adaptive_harness_scheduler.py \
+    --app <APP> --candidate-limit 5 --top-k 3 --pilot-time 20 --full-time 60
+
+Caveat: in degraded mode crashes are environment-induced, not real bugs.
+Comparison structure is still valid for thesis methodology demonstration.
+
+
+14) End-to-end minimal recipe (for thesis runs)
+-----------------------------------------------
+[CONTAINER]
+  cp __top1000_apks.txt apks.txt
+  ./run-static-pipeline.sh
+  python3 tools/build_seed_pool.py
+  python3 tools/eval_seed_transfer.py --app <APP> --harness '<HARNESS>' --time 60 --skip-preflight
+  python3 tools/adaptive_harness_scheduler.py --app <APP> --candidate-limit 5 --top-k 3 --pilot-time 20 --full-time 60
+  python3 tools/triage_host_crashes.py --app <APP>
+
+
+15) Folder map (where things land)
+----------------------------------
+  apks.txt                                                      app list (input)
+  fuzz.db, fuzzing/fuzz.db                                      fuzz queue
+  target_APK/<APP>/base.apk                                     APK
+  target_APK/<APP>/signatures_pattern.txt                       JNI signatures
+  target_APK/<APP>/static_analysis/simple_argument_constraints.txt
+  target_APK/<APP>/static_analysis/CS_<APP>.json                call sequence
+  target_APK/<APP>/harnesses/<HARNESS>/                         generated harness
+    harness.cpp, harness_debug.cpp, info.json,
+    seed_constraints.json, seeds/, seeds_transfer/
+  target_APK/<APP>/fuzzing_output_host/<HARNESS>/output_host_*  fuzz outputs
+  results/seed_pool.json                                        cross-app seed map
+  results/seed_transfer_eval_*.csv|.json                        Novelty 1 results
+  results/seed_transfer_triage_*.csv|.json                      Novelty 1 triage
+  results/coverage_guided_transfer_*.json                       per-decision provenance
+  results/adaptive_budget_eval_*.csv|.json                      Novelty 2 results
+  results/adaptive_budget_triage_*.csv|.json                    Novelty 2 triage
+  results/host_crash_triage_*.csv|.json                         Standalone triage
+  android_runtime_libs/                                         host runtime libs (optional)
+
+
+16) Common issues
+-----------------
+- Permission denied connecting to docker:
+    sudo ./run.sh    (or add user to docker group)
+- 'apks.txt not found':
+    create at repo root (or /mnt inside container).
+- harness compile fail (libharness.h not found):
+    already fixed in fuzzing/host_fuzz.py (-I flag); if it returns, ensure 'harness/cpp' exists.
+- 100% crashes with one cluster "libart.so missing":
+    runtime libs not loaded -> see section 12; or accept degraded mode (--skip-preflight).
+- Permission denied writing to results/:
+    sudo chown -R $USER:$USER .
+- Harness name with $ must be single-quoted:
+    'Java_J_N_M$1c3w6w@@0'
+
+End of SOP.
