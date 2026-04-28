@@ -1,0 +1,535 @@
+================================================================================
+Harness Creation — SOP
+From APK upload to ready-to-run harness folder, end to end
+================================================================================
+
+Audience:  you + your guide. Self-contained; no need to read any other doc.
+Scope:     ONLY the harness-creation pathway. Fuzzing / scheduling / triage
+           are NOT covered here (see sop1.txt for those stages).
+Outcome:   for every native JNI function in every app you drop in, you end up
+           with one or more fully compiled-ready harness folders under
+           target_APK/<app>/harnesses/.
+
+================================================================================
+PART 0 — Big picture in one page
+================================================================================
+
+          APK file
+             |
+             v
+   +-----------------------+
+   | 1. APK preparation    |   place base.apk under target_APK/<app>/
+   +-----------------------+
+             |
+             v
+   +-----------------------+
+   | 2. Static analysis    |   produces 3 inputs the generator needs:
+   |    (3 sub-stages)     |     - signatures_pattern.txt
+   |                       |     - simple_argument_constraints.txt (optional)
+   |                       |     - CS_<app>.json                   (optional)
+   +-----------------------+
+             |
+             v
+   +-----------------------+
+   | 3. Harness generation |   harness_generator.py reads the 3 inputs
+   |    (4 strategy passes)|   fills the C++ skeleton for each function
+   |                       |   writes one folder per (function, strategy, context)
+   +-----------------------+
+             |
+             v
+   +-----------------------+
+   | 4. DB registration    |   build_fuzz_queue.py sanity-checks each
+   |                       |   harness folder and records it in fuzz.db
+   +-----------------------+
+             |
+             v
+       ready to fuzz
+       (handed off to sop1.txt)
+
+
+================================================================================
+PART 1 — APK preparation (what "upload" means)
+================================================================================
+
+1.1 Directory convention.
+    For app with package id <APP> (e.g. com.tplink.skylight), the pipeline
+    always expects:
+
+       target_APK/<APP>/base.apk
+
+    You may also keep the original file alongside it; it is fine if
+    target_APK/<APP>/<APP>.apk also exists. Only base.apk is read.
+
+1.2 Minimal manual steps.
+
+       mkdir -p target_APK/com.tplink.skylight
+       cp /path/to/com.tplink.skylight.apk target_APK/com.tplink.skylight/base.apk
+
+1.3 Tell the pipeline which apps are "in".
+    Edit apks.txt to list the package ids, one per line, no "#" comments,
+    no blank lines. Example:
+
+       com.tplink.skylight
+       com.UCMobile.intl
+
+1.4 Sanity check before running anything.
+
+       for a in $(cat apks.txt); do
+         [ -f "target_APK/$a/base.apk" ] && echo "OK   $a" || echo "MISS $a"
+       done
+
+
+================================================================================
+PART 2 — Static analysis (the 3 inputs to the generator)
+================================================================================
+
+Static analysis produces the three files that describe the native surface of
+the app. The harness generator CANNOT produce anything without the first of
+them; the other two are optional but unlock richer variants.
+
+---------- 2.1  Sub-stage A: Native signature extraction ----------
+
+Why:        you need a list of JNI functions and their types.
+How:        DEX is decompiled; every Java method with the `native` keyword is
+            collected; its name is mangled to the JNI symbol form
+            (Java_<Class>_<method>); return and argument types are recorded.
+Command:
+
+       python3 static_analysis/preprocess.py --target <APP> --signatures --static_only
+
+Produces:   target_APK/<APP>/signatures_pattern.txt
+
+Shape (one line per function):
+
+       Java_com_uc_util_NativeUtil_decodeBuffer  : jbyteArray(jbyteArray, jint)
+       |_______________ JNI symbol _____________|  |_return_|  |_arg types_|
+
+Result without this file: ZERO harnesses will be produced.
+
+---------- 2.2  Sub-stage B: Argument constraint analysis ----------
+
+Why:        random seeds are wasteful; if FlowDroid can see the app always
+            passes a short ASCII string, the harness can emit seeds that
+            respect that.
+How:        inter-procedural data-flow from Java call-sites of each native
+            function; records constants, ranges, length relations.
+Command:
+
+       python3 static_analysis/preprocess.py --target <APP> --argument_analysis --static_only
+
+Produces:   target_APK/<APP>/static_analysis/simple_argument_constraints.txt
+
+Shape:
+
+       Java_...decodeBuffer | arg0:jbyteArray | length=[0, 4096]
+       Java_...decodeBuffer | arg1:jint       | range=[0, length(arg0)]
+
+Result without this file: still get the "signature only" variant of each
+function, just not the "argument-aware" variant.
+
+---------- 2.3  Sub-stage C: Call-sequence analysis ----------
+
+Why:        many native functions assume a specific Java-side setup before
+            they are called. Reproducing that setup turns noise into real
+            coverage.
+How:        Soot-based class-hierarchy call graph; per native function, record
+            the Java operations right before the call and the data-flow into
+            the native call's arguments.
+Command:
+
+       python3 static_analysis/preprocess.py --target <APP> --callsequence_analysis --static_only
+
+Produces:   target_APK/<APP>/static_analysis/CS_<APP>.json
+
+Shape (trimmed):
+
+       {
+         "Java_...decodeBuffer": {
+           "callers": [{
+             "method": "com.uc.LoginHelper.verify",
+             "pre_call_ops": [
+               {"op": "new_byte_array", "size": 64},
+               {"op": "fill_bytes",      "pattern": "0x20..0x7F"},
+               {"op": "call_native",     "target": "decodeBuffer"}
+             ]
+           }]
+         }
+       }
+
+Result without this file: "call-sequence" and "combined" variants are not
+generated; "signature-only" and "argument-aware" still are.
+
+---------- 2.4  One-shot across all apps in apks.txt ----------
+
+       export APKS="$(pwd)/apks.txt"
+       export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"   # helps with large apps
+       python3 run_static_analysis_batch.py
+
+This script runs all three sub-stages per app, but is idempotent: if an
+output file already exists for an app, that sub-stage is skipped.
+
+
+================================================================================
+PART 3 — Harness generation: what a harness IS
+================================================================================
+
+3.1 Definition.
+    A harness is a small standalone C++ program that:
+      (a) reads a raw byte buffer,
+      (b) parses it into JNI-typed arguments using a byte layout we record,
+      (c) loads the target native library with dlopen,
+      (d) resolves the target JNI symbol with dlsym (or an offset),
+      (e) invokes the target function with the parsed arguments,
+      (f) exits 0, or crashes — whichever the function does.
+
+3.2 One harness = one (function, strategy, call-site context).
+
+    - "function"  is the JNI symbol being wrapped (one native method).
+    - "strategy"  is which static inputs were used while filling the skeleton
+                  (signature only / + constraints / + call sequence / both).
+    - "context"   is which of the (possibly multiple) call sequences for that
+                  function is being replayed; encoded as a numeric counter.
+
+3.3 Folder naming scheme:
+
+       Java_com_uc_util_NativeUtil_decodeBuffer @ arg-cs @ 0
+       └───────────────── JNI symbol ──────────┘ └meta─┘ counter
+
+    Meta tag tells you the strategy:
+       @@        signature only
+       @arg@     + argument constraints
+       @cs@      + call-sequence replay
+       @arg-cs@  + both
+       @arg-io@, @cs-io@ ...  (when input/output threading across the
+                               call sequence is also enabled)
+
+
+================================================================================
+PART 4 — The skeleton and the placeholders
+================================================================================
+
+4.1 The template file the generator starts from:
+
+       harness/cpp/harness_skeleton.cpp
+
+    Think of it as a C++ file with hole markers. Every hole is a symbolic
+    token that starts with "GENERATOR_". The generator replaces each hole
+    with code computed from the static-analysis data for that particular
+    function.
+
+4.2 The five placeholders (what each one is replaced with):
+
+       GENERATOR_FUNCTIONDEFINTION
+           typedef of the target function's signature, using the JNI types
+           from signatures_pattern.txt, e.g.
+              typedef jbyteArray function_0(JNIEnv*, jobject, jbyteArray, jint);
+
+       GENERATOR_GLOBALFUNCTIONS
+           global function pointer(s), e.g.
+              function_0* targetFunctionPtr0;
+           plus any helpers needed for the call-sequence pre-ops.
+
+       GENERATOR_INPUTPARSING
+           the byte-to-JNI parser for this function: it knows, for each
+           argument, how many bytes to consume, which length-prefix layout
+           to respect, and which values are legal (from the constraints
+           file). It emits local jXxx variables arg0, arg1, ...
+
+       GENERATOR_CALLINGTARGETFUNCTION
+           the actual invocation:
+              auto result = targetFunctionPtr0(env, jthis, arg0, arg1);
+           If the strategy is @cs@ or @arg-cs@, the pre-call ops from
+           CS_<APP>.json are emitted here *before* this line, using the
+           io-threading rules from -cs_io if enabled.
+
+       GENERATOR_FUNCTIONOFFSETS
+           the symbol resolution:
+              targetFunctionPtr0 = (function_0*)dlsym(libHandle, "Java_...");
+           When signatures_libraries_offsets.txt is present (produced
+           on-device), this can be replaced by an offset-based lookup
+           against targetLibBase instead of dlsym.
+
+4.3 Two builds written per harness folder:
+
+       harness.cpp        for AFL / libFuzzer mode (uses the afl.js
+                          preloading flow and the GENERATOR_FUNCTIONOFFSETS
+                          offset path).
+       harness_debug.cpp  standalone binary used by the host-side runner.
+                          Same source structure but simpler main() and
+                          dlsym-only symbol resolution.
+
+
+================================================================================
+PART 5 — What the generator actually does (per function)
+================================================================================
+
+For every function listed in signatures_pattern.txt, the generator:
+
+  1. Reads its return type and argument types (signature).
+  2. Looks up its argument constraints (if simple_argument_constraints.txt
+     exists and -ct_argval flag is on).
+  3. Looks up its call-sequence contexts (if CS_<APP>.json exists and
+     -cs_ph flag is on). Each distinct context becomes a separate counter N.
+  4. Decides whether this harness should be emitted at all:
+       - if -fuzz is set, skip functions whose arguments are all primitives
+         (int / boolean) — nothing worth mutating.
+       - if -only_constrained is set, skip functions without any known
+         constraints.
+  5. Creates the folder:
+        target_APK/<APP>/harnesses/<JNI_SYMBOL>@<meta>@<N>/
+  6. Copies harness_skeleton.cpp and harness_skeleton_debug.cpp, fills in
+     every GENERATOR_ placeholder with code built from the data above.
+  7. Writes:
+        harness.cpp          -> the fuzz build
+        harness_debug.cpp    -> the debug/host build
+        afl.js               -> the Frida preloading script (AFL mode)
+        info.json            -> target library name, class, arg count, etc.
+        seed_constraints.json -> byte layout for the parser
+        seeds/               -> 5–10 structured initial seeds
+  8. Records the function in meta_harness2nrfuzzargs.json so downstream
+     scripts know how many bytes-per-arg the parser expects.
+
+
+================================================================================
+PART 6 — The four strategy variants, in detail
+================================================================================
+
+The generator is run FOUR times, once per flag combination. Each run produces
+one variant of every eligible function. The flags used:
+
+       Pass 1 -> "-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -ct_argval -fuzz --afl_coverage_on"
+                 produces variant:  @arg-cs@N   (highest fidelity)
+       Pass 2 -> "-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -fuzz --afl_coverage_on"
+                 produces variant:  @cs@N       (call-sequence only)
+       Pass 3 -> "-jo_ok -ct_argval -fuzz --afl_coverage_on"
+                 produces variant:  @arg@N      (constraints only)
+       Pass 4 -> "-jo_ok -fuzz --afl_coverage_on"
+                 produces variant:  @@N         (signature only baseline)
+
+What each flag means:
+
+       -jo_ok            keep functions registered via JNI_OnLoad /
+                         RegisterNatives (don't drop them).
+       -ct_argval        use argument constraints; activates @arg variants.
+       -cs_ph            use call-sequence phenomenon replay; activates @cs.
+       -cs_io            thread values across pre-call ops so that outputs
+                         of one op feed inputs of the next and of the
+                         native call.
+       -cs_ph_min_len 1  only emit @cs when the pre-call sequence has at
+                         least one op besides the call itself.
+       -fuzz             skip functions whose argument types have nothing
+                         fuzzable (all primitives).
+       --afl_coverage_on emit the AFL coverage hooks into the Makefile.
+
+Typical output per function:
+
+       function has no constraints, no call sequence
+           -> only @@0
+
+       function has constraints, no call sequence
+           -> @@0, @arg@0
+
+       function has no constraints, one call sequence
+           -> @@0, @cs@0
+
+       function has constraints, K distinct call sequences
+           -> @@0, @arg@0, @cs@0..@cs@(K-1), @arg-cs@0..@arg-cs@(K-1)
+
+
+================================================================================
+PART 7 — Inside a finished harness folder
+================================================================================
+
+Example path:
+       target_APK/com.UCMobile.intl/harnesses/Java_com_uc_util_NativeUtil_decodeBuffer@arg-cs@0/
+
+Files:
+
+       harness.cpp               C++ for fuzz build (AFL / libFuzzer).
+       harness_debug.cpp         C++ for the standalone host-side binary.
+       afl.js                    Frida preload: unmapping, library base
+                                 capture, JVM attach.
+       info.json                 metadata. Typical keys:
+                                   target_library : "libX.so"
+                                   target_class   : "com/uc/util/NativeUtil"
+                                   args           : 2
+                                   seed_mode      : "constraint"
+                                   seed_arg_list  : [...]
+       seed_constraints.json     byte layout the parser in harness_debug.cpp
+                                 follows. Crucial for later cross-app seed
+                                 transfer and for structured mutation.
+       seeds/                    initial corpus:
+                                   seed_<argtypetag>_1
+                                   seed_<argtypetag>_2
+                                   ...
+
+How to inspect one on disk:
+
+       APP=com.UCMobile.intl
+       HARN=$(ls target_APK/$APP/harnesses | head -1)
+       echo "$HARN"
+       ls     target_APK/$APP/harnesses/$HARN
+       cat    target_APK/$APP/harnesses/$HARN/info.json | python3 -m json.tool
+       head -40 target_APK/$APP/harnesses/$HARN/harness_debug.cpp
+       ls     target_APK/$APP/harnesses/$HARN/seeds
+
+
+================================================================================
+PART 8 — How seeds are generated
+================================================================================
+
+8.1 The generator collapses all "needs-fuzzing" arguments of the function
+    and the call-sequence (arguments that come from a previous call in the
+    sequence are dropped — they are satisfied by the replay, not the seed).
+
+8.2 For each surviving argument it emits a small, diverse set of byte
+    patterns based on the JNI type:
+
+       jbyteArray   : length-prefixed random bytes; also empty, single-byte,
+                      max-length variants.
+       jstring      : length-prefixed ASCII / UTF-8 samples; also empty;
+                      also samples from observed constant strings.
+       jint / jlong : zero, one, small, large, boundary (MIN/MAX); values
+                      from the constraint range if present.
+       jboolean     : 0 and 1.
+       jbyte        : 0x00, 0x01, 0x7F, 0x80, 0xFF.
+       jobject      : a minimal "generic object" blob, only if
+                      -generic_jobject is set.
+
+8.3 Each seed file is written under seeds/ with a name that encodes which
+    argument type it belongs to and a numeric counter, so the mutator has
+    a diverse corpus from the very first run.
+
+8.4 seed_constraints.json records, per argument, how many bytes the parser
+    consumes, which length-prefix layout is used, and any bounds. Later
+    stages rely on this file to mutate mutants that still parse cleanly.
+
+
+================================================================================
+PART 9 — End-to-end commands (copy-paste block)
+================================================================================
+
+From the repo root (/mnt inside the container):
+
+       # 0. apps to process
+       cat apks.txt                     # one package id per line, no "#"
+
+       # 1. place APKs
+       #    target_APK/<APP>/base.apk   (you already did this)
+
+       # 2. static analysis (3 sub-stages, idempotent)
+       export APKS="$(pwd)/apks.txt"
+       export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"
+       python3 run_static_analysis_batch.py
+
+       # 3. harness generation, 4 variant passes
+       HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -ct_argval -fuzz --afl_coverage_on" \
+           python3 generate_harnesses_batch.py
+       HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -fuzz --afl_coverage_on" \
+           python3 generate_harnesses_batch.py
+       HARNESS_GEN_FLAGS="-jo_ok -ct_argval -fuzz --afl_coverage_on" \
+           python3 generate_harnesses_batch.py
+       HARNESS_GEN_FLAGS="-jo_ok -fuzz --afl_coverage_on" \
+           python3 generate_harnesses_batch.py
+
+       # 4. register every harness in the DB
+       python3 build_fuzz_queue.py
+
+OR use the one-shot wrapper (equivalent to all of the above, plus it wipes
+target_APK/*/harnesses/* first so you start clean):
+
+       ./run-static-pipeline.sh
+
+
+================================================================================
+PART 10 — Verification and quick stats
+================================================================================
+
+10.1 Confirm harnesses exist for an app:
+
+       APP=com.UCMobile.intl
+       ls target_APK/$APP/harnesses | head
+       ls target_APK/$APP/harnesses | wc -l                                       # total variants
+       ls target_APK/$APP/harnesses | awk -F'@' '{print $1}' | sort -u | wc -l    # unique functions
+
+10.2 Variant breakdown:
+
+       ls target_APK/$APP/harnesses | awk -F'@' '{print "@"$2"@"}' | sort | uniq -c
+
+10.3 Rows in the DB:
+
+       python3 - <<PY
+       import sqlite3
+       con = sqlite3.connect("fuzzing/fuzz.db")
+       for row in con.execute("SELECT app, COUNT(*) FROM fuzzdata GROUP BY app"):
+           print(row)
+       PY
+
+10.4 Inspect one variant end-to-end:
+
+       HARN=$(ls target_APK/$APP/harnesses | head -1)
+       echo wraps:  $(echo $HARN | awk -F'@' '{print $1}')
+       cat     target_APK/$APP/harnesses/$HARN/info.json | python3 -m json.tool
+       cat     target_APK/$APP/harnesses/$HARN/seed_constraints.json | python3 -m json.tool
+       head -60 target_APK/$APP/harnesses/$HARN/harness_debug.cpp
+       ls      target_APK/$APP/harnesses/$HARN/seeds
+
+
+================================================================================
+PART 11 — Common symptoms and what they mean
+================================================================================
+
+Symptom:  harnesses/ folder is MISSING for an app.
+Cause:    the app is not in apks.txt, or base.apk is missing under
+          target_APK/<APP>/. run-static-pipeline.sh only processes apps
+          listed in apks.txt.
+Fix:      add the app to apks.txt, ensure target_APK/<APP>/base.apk exists,
+          then re-run harness generation.
+
+Symptom:  "FIXME PHENOMENON NOT PRESENT" printed at build-queue time.
+Cause:    CS_<APP>.json has no qualifying call sequence for some function.
+Effect:   @cs and @arg-cs variants are not emitted for that function. @@0
+          and @arg@0 still are. This is normal, not an error.
+
+Symptom:  signatures_pattern.txt empty; no harnesses at all.
+Cause:    the Java side has no `native` methods, or DEX decompile failed.
+Fix:      re-run sub-stage A with CLEAN=1 to force a clean extraction:
+             CLEAN=1 python3 run_static_analysis_batch.py
+          If the file stays empty, the app genuinely has no JNI to fuzz.
+
+Symptom:  harness count surprisingly low.
+Cause:    -fuzz filtered out functions whose arguments are all primitives.
+Fix:      for a sanity check only, run one pass without -fuzz:
+             HARNESS_GEN_FLAGS="-jo_ok --afl_coverage_on" \
+                 python3 harness/harness_generator.py -jo_ok --target <APP>
+          If this produces many folders, the pipeline is healthy and the
+          earlier low count was the fuzzable-argument filter working as
+          intended.
+
+Symptom:  Stage 3 (call-sequence analysis) OOMs on a big app.
+Cause:    Soot's CHA call graph needs a lot of heap.
+Fix:      export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m" and re-run only the
+          callsequence_analysis sub-stage for that app.
+
+
+================================================================================
+PART 12 — One-paragraph summary
+================================================================================
+
+Harness creation is a template-filling pipeline. You drop a base.apk into
+target_APK/<APP>/, list the app in apks.txt, and run static analysis. That
+produces three artefacts: a list of JNI functions, an argument-constraint
+file, and a call-sequence JSON. The harness generator reads all three and,
+for every function, fills the holes in harness_skeleton.cpp to produce up
+to four strategy variants — from a bare "signature only" harness to a
+combined "constraint + call-sequence" harness. Each variant is written as
+its own folder containing harness.cpp, harness_debug.cpp, info.json,
+seed_constraints.json, and a seeds/ directory of structured initial
+corpora. Finally, build_fuzz_queue.py walks the harnesses, sanity-checks
+them, and registers the survivors in a SQLite catalogue. From that point
+on, the rest of the pipeline (seed transfer, adaptive scheduling, fuzzing,
+triage) operates only on the catalogue — the harness folders are ready.
+
+================================================================================
+END
+================================================================================

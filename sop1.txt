@@ -1,0 +1,1327 @@
+SoFuzz — Thesis Runbook (SOP1)
+==============================
+
+Purpose:
+  Complete, example-driven SOP. Every command uses a real app name so you
+  can paste it and run it. Every stage explains what its output means.
+  Ends with deep coverage of the three novelties.
+
+Running example apps used in this SOP:
+  - com.UCMobile.intl                            (static-analysis walk-through)
+  - com.android.chrome                           (novelty experiments)
+  - com.google.android.googlequicksearchbox      (Stage-3 OOM mitigation example)
+
+
+============================================================
+PART A — One-time setup
+============================================================
+
+A.1  On the VM (host shell, not container):
+
+       cd ~/sofuzz-v1
+       chmod +x setup.sh run.sh run-static-pipeline.sh run_ubuntu_experiment.sh run_host_fuzz.sh
+       ./setup.sh               # downloads dataset, builds Docker image (one time)
+
+A.2  Fix permissions (run once if you ever used sudo inside the repo):
+
+       sudo chown -R $USER:$USER ~/sofuzz-v1
+
+A.3  Enter the container:
+
+       cd ~/sofuzz-v1
+       sudo ./run.sh
+       # you are now at: root@<id>:/mnt#
+
+
+============================================================
+PART B — Select the apps to process
+============================================================
+
+B.1  Pick 2-3 apps for thesis. Put their package names in apks.txt,
+     one per line. Example:
+
+       cat > apks.txt <<'EOF'
+       com.UCMobile.intl
+       com.android.chrome
+       com.google.android.googlequicksearchbox
+       EOF
+
+     Each app MUST have target_APK/<app>/base.apk present.
+
+B.2  Sanity check APK files:
+
+       while read -r a; do
+         [ -z "$a" ] && continue
+         [ -f "target_APK/$a/base.apk" ] && echo "OK   $a" || echo "MISS $a"
+       done < apks.txt
+
+     Expected output:
+       OK   com.UCMobile.intl
+       OK   com.android.chrome
+       OK   com.google.android.googlequicksearchbox
+
+
+============================================================
+PART C — Static analysis, stage by stage
+          (what is produced and what each line means)
+============================================================
+
+We will do one app (com.UCMobile.intl) by hand to see every artifact clearly.
+
+---------- C.1  Stage 1: Native signature extraction ----------
+
+Command:
+       python3 static_analysis/preprocess.py \
+           --target com.UCMobile.intl --signatures --static_only
+
+What it does:
+  - Runs jadx on base.apk, extracts DEX.
+  - A Java extractor walks Java classes, finds every `native` method declared.
+  - Writes one line per JNI function with its name, return type, argument types.
+
+Output file:
+       target_APK/com.UCMobile.intl/signatures_pattern.txt
+
+Example contents (first few lines):
+       Java_com_uc_util_NativeUtil_getEncryptKey : jstring()
+       Java_com_uc_util_NativeUtil_decodeBuffer  : jbyteArray(jbyteArray, jint)
+       Java_com_uc_crypto_Cipher_hashSHA1        : jstring(jstring)
+
+Meaning:
+  - Column 1: JNI symbol name the C library must export.
+  - Column 2: JNI return type (jstring, jint, void, jbyteArray, jobject, ...).
+  - Parentheses list: argument types (JNIEnv* and jobject/jclass are implicit).
+
+Why it matters:
+  This file is the starting alphabet for harness generation. One harness is
+  generated per function listed here (filtered by heuristics).
+
+Sometimes you also see:
+       target_APK/com.UCMobile.intl/signatures_pattern_soot.txt
+
+  Same information, produced by a Soot-based extractor as a cross-check to
+  pick up functions jadx missed.
+
+
+---------- C.2  Stage 2: Argument constraint analysis (FlowDroid) ----------
+
+Command:
+       python3 static_analysis/preprocess.py \
+           --target com.UCMobile.intl --argument_analysis --static_only
+
+What it does:
+  - Runs FlowDroid data-flow analysis on the Java side.
+  - For every native call, traces back into caller code to learn constraints
+    on the arguments (constants, allowed ranges, length relations, paths).
+
+Output file:
+       target_APK/com.UCMobile.intl/static_analysis/simple_argument_constraints.txt
+
+Example contents:
+       Java_com_uc_crypto_Cipher_hashSHA1 | arg0:jstring | constant="sha1-seed"
+       Java_com_uc_util_NativeUtil_decodeBuffer | arg1:jint | range=[0, length(arg0)]
+
+Meaning of each part:
+  - First field: JNI symbol.
+  - arg0 / arg1 ...: argument index (0-based; not counting JNIEnv* / jobject).
+  - constant=...    : exact value seen at call sites.
+  - range=[a, b]    : FlowDroid derived bounds.
+  - length(argK)    : length of another argument (e.g. for buffer+size pairs).
+
+Why it matters:
+  Harness generator uses these constraints to produce `@arg@` variants that
+  feed the native function bytes that actually make sense (instead of random).
+
+
+---------- C.3  Stage 3: Call-sequence / call-graph analysis (Soot) ----------
+
+Command:
+       python3 static_analysis/preprocess.py \
+           --target com.UCMobile.intl --callsequence_analysis --static_only
+
+What it does:
+  - Soot builds a class-hierarchy call graph for the app.
+  - For every native function, records the Java methods that call it and
+    the operations done right before (pre-call context).
+  - This gives the harness a recipe for setting up state before invocation.
+
+Output file:
+       target_APK/com.UCMobile.intl/static_analysis/CS_com.UCMobile.intl.json
+
+Example JSON (trimmed):
+       {
+         "Java_com_uc_util_NativeUtil_decodeBuffer": {
+           "callers": [
+             {
+               "method": "com.uc.LoginHelper.verify",
+               "pre_call_ops": [
+                 {"op": "new_byte_array", "size": 64},
+                 {"op": "fill_bytes",      "pattern": "0x20..0x7F"},
+                 {"op": "call_native",     "target": "decodeBuffer"}
+               ]
+             }
+           ]
+         }
+       }
+
+Meaning:
+  - For each native symbol, list of (caller, pre_call_ops).
+  - pre_call_ops tell the harness "put this state together before calling".
+
+Why it matters:
+  Enables `@cs@` and `@arg-cs@` harness variants, which are the most realistic
+  (they mimic the exact way the app invokes the native function at runtime).
+
+Stage 3 limitation (OOM on large apps):
+  If the JVM runs out of heap, you will see a stack trace ending with
+  java.lang.OutOfMemoryError and the JSON file will be missing. Mitigation:
+
+       export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"
+       python3 static_analysis/preprocess.py \
+           --target com.google.android.googlequicksearchbox \
+           --argument_analysis --static_only
+       python3 static_analysis/preprocess.py \
+           --target com.google.android.googlequicksearchbox \
+           --callsequence_analysis --static_only
+
+  Expected output for QSB with 16 GB heap:
+       [+] Finished argument flowdroid analysis for com.google.android...
+       [+] Finished callsequence analysis for com.google.android...
+
+  If 16 GB still OOMs (common for Chrome / Maps), the pipeline degrades
+  gracefully: you keep `@@0` / `@arg@0` variants, you lose `@cs@` variants.
+  Document this as a known scalability limitation in the thesis.
+
+
+---------- C.4  Stage 4: Harness generation ----------
+
+Do all 3 static stages on all apps at once + generate harnesses + build DB:
+
+Command (one-shot):
+       ./run-static-pipeline.sh
+
+What the script does (in order):
+  1. Wipes old harnesses:   rm -rf target_APK/*/harnesses/*
+  2. Runs run_static_analysis_batch.py for every app in apks.txt.
+  3. Runs generate_harnesses_batch.py four times, each with different flags:
+        HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -ct_argval -fuzz --afl_coverage_on"
+        HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -fuzz --afl_coverage_on"
+        HARNESS_GEN_FLAGS="-jo_ok -ct_argval -fuzz --afl_coverage_on"
+        HARNESS_GEN_FLAGS="-jo_ok -fuzz --afl_coverage_on"
+     This produces 4 strategy variants per native function.
+  4. Runs build_fuzz_queue.py to populate fuzzing/fuzz.db.
+
+Example terminal output (trimmed):
+       [STATIC] processing com.UCMobile.intl
+       [STATIC] running argument analysis for com.UCMobile.intl
+       [+] Finished argument flowdroid analysis for com.UCMobile.intl
+       [STATIC] running call-sequence analysis for com.UCMobile.intl
+       [+] Finished callsequence analysis for com.UCMobile.intl
+       ...
+       adding apk: com.UCMobile.intl
+       Ready com.UCMobile.intl
+       [STATIC] Static-only pipeline completed.
+
+Output folders (per app after Stage 4):
+       target_APK/com.UCMobile.intl/harnesses/
+           Java_..._@@0/             <- plain (signature only)
+           Java_..._@arg@0/          <- with argument constraints
+           Java_..._@cs@0/           <- with call-sequence context
+           Java_..._@arg-cs@0/       <- with both
+
+Each harness folder contains:
+       harness.cpp            <- fuzz build
+       harness_debug.cpp      <- debug build (used by host_fuzz.py)
+       info.json              <- variant metadata (target lib, target class, etc.)
+       seed_constraints.json  <- byte layout for parsing seeds back to JNI args
+       seeds/                 <- 5-10 structured initial seeds
+
+Meaning of variants:
+  - @@0         : random-ish mutation only; smallest baseline.
+  - @arg@0      : seeds/parser respect FlowDroid argument constraints.
+  - @cs@0       : harness first replays the pre-call ops, then invokes native.
+  - @arg-cs@0   : combines both; highest-fidelity variant.
+
+
+---------- C.4.1  Deep dive: run-static-pipeline.sh ----------
+
+Exact script body (this is the whole file, line for line):
+
+       #!/bin/bash
+       export APKS="$(pwd)/apks.txt"
+       # export CLEAN=1
+       export SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+       export FUZZ_DATA="${SCRIPT_DIR}/$(date +%s)_fuzzing_data"
+
+       rm -rf "${FUZZ_DATA}"
+       mkdir "${FUZZ_DATA}"
+
+       rm -rf target_APK/*/harnesses/*
+       python3 run_static_analysis_batch.py
+
+       export HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -ct_argval -fuzz --afl_coverage_on"
+       python3 generate_harnesses_batch.py
+       export HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -fuzz --afl_coverage_on"
+       python3 generate_harnesses_batch.py
+       export HARNESS_GEN_FLAGS="-jo_ok -ct_argval -fuzz --afl_coverage_on"
+       python3 generate_harnesses_batch.py
+       export HARNESS_GEN_FLAGS="-jo_ok -fuzz --afl_coverage_on"
+       python3 generate_harnesses_batch.py
+
+       export APP2FNAMES="${FUZZ_DATA}/app2fnames.json"
+       python3 build_fuzz_queue.py
+       cp fuzzing/fuzz.db "${FUZZ_DATA}/" 2>/dev/null || true
+
+       echo "[STATIC] Static-only pipeline completed."
+
+Environment variables the script exports:
+
+       APKS        = $(pwd)/apks.txt
+                     File listing one APK package name per line. Both
+                     run_static_analysis_batch.py and generate_harnesses_batch.py
+                     iterate over this list.
+                     To process fewer apps: just edit apks.txt.
+
+       SCRIPT_DIR  = absolute path of the repo (where the script itself lives).
+
+       FUZZ_DATA   = ${SCRIPT_DIR}/<epoch>_fuzzing_data
+                     A fresh timestamped folder created per run. At the end,
+                     fuzzing/fuzz.db is copied into it as a snapshot so you can
+                     keep multiple experiment generations side by side without
+                     overwriting.
+
+       CLEAN       = (commented out by default; set to 1 to re-run everything)
+                     When set, run_static_analysis_batch.py deletes the
+                     previously produced per-app static outputs before
+                     re-running:
+                       signatures_pattern.txt
+                       signatures_libraries_offsets.txt
+                       static_analysis/simple_argument_constraints.txt
+                       static_analysis/CS_<app>.json
+                     Without CLEAN, any stage whose output already exists is
+                     skipped (idempotent behaviour — very useful for iterating
+                     on one stage at a time).
+
+       APP2FNAMES  = ${FUZZ_DATA}/app2fnames.json
+                     Reserved for tools that want a JSON listing of every
+                     (app -> harness name) pair; produced only if
+                     build_fuzz_queue.py chooses to emit it.
+
+       HARNESS_GEN_FLAGS = set four different values back to back, one per
+                     invocation of generate_harnesses_batch.py. Each flag
+                     combination produces a different *strategy variant* of
+                     every harness (see C.4 "Meaning of variants"). Flags used:
+
+                       -jo_ok             include JNI OnLoad / registerNatives
+                                          resolved functions (otherwise dropped)
+                       -cs_ph             enable call-sequence placeholder
+                                          mode (harness replays pre-call ops)
+                       -cs_io             include call-sequence input/output
+                                          threading (args used/produced across
+                                          pre-call ops)
+                       -cs_ph_min_len 1   minimum pre-call sequence length to
+                                          still emit a harness (1 = any)
+                       -ct_argval         use FlowDroid argument constants /
+                                          ranges when constructing seeds
+                       -fuzz              emit the fuzz build (harness.cpp
+                                          against libFuzzer-style entry point)
+                       --afl_coverage_on  also emit AFL-style instrumentation
+                                          switches in the Makefile (only used
+                                          when AFL mode is selected later)
+
+                     The four passes together produce (per native function):
+                       Java_..._@@0        from pass 4: -jo_ok -fuzz
+                       Java_..._@arg@0     from pass 3: adds -ct_argval
+                       Java_..._@cs@0      from pass 2: adds -cs_ph etc.
+                       Java_..._@arg-cs@0  from pass 1: adds everything
+
+What the four script stages do (internal dataflow):
+
+       STAGE I  — wipe previous harnesses
+                 rm -rf target_APK/*/harnesses/*
+                 Ensures harness folders are not a mixture of old + new
+                 strategies. Static-analysis outputs are kept (expensive).
+
+       STAGE II — run_static_analysis_batch.py
+                 For every APK in apks.txt:
+                   run_static_preprocess(apk)
+                     -> signatures    if signatures_pattern.txt missing
+                     -> arg analysis  if simple_argument_constraints.txt missing
+                     -> call-seq      if CS_<app>.json missing
+                 Each step is a subprocess.check_call to
+                 static_analysis/preprocess.py with the appropriate flag.
+                 Output folders updated in-place under target_APK/<app>/.
+
+       STAGE III — generate_harnesses_batch.py (run 4 times)
+                 For every APK in apks.txt that has base.apk:
+                   python3 harness/harness_generator.py $HARNESS_GEN_FLAGS \
+                       --target <apk>
+                 Produces target_APK/<apk>/harnesses/Java_..._@<variant>0/
+                 with harness.cpp, harness_debug.cpp, info.json,
+                 seed_constraints.json and 5-10 structured initial seeds
+                 under seeds/.
+
+       STAGE IV — build_fuzz_queue.py
+                 Scans all generated harness folders, sanity-checks each
+                 (must have base.apk, signatures_pattern.txt, and a readable
+                 harness_debug.cpp), and writes fuzzing/fuzz.db with one
+                 row per (app, fname) pair. A copy is dropped into
+                 ${FUZZ_DATA}/fuzz.db as a generation snapshot.
+
+How to run it for just a subset of apps:
+
+       # keep only the apps you want in apks.txt (one per line)
+       cat > apks.txt <<'EOF'
+       com.UCMobile.intl
+       com.android.chrome
+       EOF
+
+       # optional: force a full rebuild
+       export CLEAN=1
+
+       # run the whole static+harness+DB pipeline
+       ./run-static-pipeline.sh
+
+How to run it stage-by-stage (e.g. while debugging):
+
+       export APKS="$(pwd)/apks.txt"
+       python3 run_static_analysis_batch.py                # Stage II only
+       HARNESS_GEN_FLAGS="-jo_ok -fuzz --afl_coverage_on" \
+           python3 generate_harnesses_batch.py             # one variant only
+       python3 build_fuzz_queue.py                         # rebuild DB
+
+Expected terminal output (trimmed), with two apps in apks.txt:
+
+       [STATIC] processing com.UCMobile.intl
+       [STATIC] extracting native signatures for com.UCMobile.intl
+       [STATIC] running argument analysis for com.UCMobile.intl
+       [+] Finished argument flowdroid analysis for com.UCMobile.intl
+       [STATIC] running callsequence analysis for com.UCMobile.intl
+       [+] Finished callsequence analysis for com.UCMobile.intl
+       [STATIC] processing com.android.chrome
+       ... (argument analysis may OOM on Chrome; see C.3)
+       adding apk: com.UCMobile.intl
+       Ready com.UCMobile.intl
+       adding apk: com.android.chrome
+       Ready com.android.chrome
+       [STATIC] Static-only pipeline completed.
+
+What "Ready <app>" means:
+  build_fuzz_queue.py successfully registered at least one harness for
+  <app> into fuzzing/fuzz.db. If you see "FIXME ... NOT PRESENT" above,
+  that particular static stage did not produce its output for that app;
+  harnesses are still generated using the variants that do have the
+  required inputs, so partial success is normal.
+
+Quick failure triage after the script exits:
+
+       # did fuzz.db get built?
+       ls -lh fuzzing/fuzz.db
+       python3 - <<'PY'
+       import sqlite3
+       con = sqlite3.connect("fuzzing/fuzz.db")
+       for row in con.execute("SELECT app, COUNT(*) FROM fuzzdata GROUP BY app"):
+           print(row)
+       PY
+
+       # per-app static outputs
+       for app in $(cat apks.txt); do
+         echo "== $app =="
+         ls target_APK/$app/signatures_pattern.txt 2>/dev/null \
+            target_APK/$app/static_analysis/simple_argument_constraints.txt 2>/dev/null \
+            target_APK/$app/static_analysis/CS_$app.json 2>/dev/null
+         echo " harnesses: $(ls target_APK/$app/harnesses 2>/dev/null | wc -l)"
+       done
+
+       # the generation snapshot
+       ls -d *_fuzzing_data/ | tail -1
+       ls  $(ls -d *_fuzzing_data/ | tail -1)
+
+Common pitfalls specific to this script:
+
+  - You removed apks.txt entries but old harness folders survive.
+       => that is by design only within one run. Re-running the script wipes
+          target_APK/*/harnesses/* first. If you want to wipe static
+          outputs too, set CLEAN=1.
+
+  - JAVA_TOOL_OPTIONS not exported.
+       => Stage II may OOM on large apps. Before ./run-static-pipeline.sh:
+            export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"
+
+  - You ran the script as root (inside or outside the container) and now
+    .git/objects or target_APK/ are owned by root.
+       => sudo chown -R $USER:$USER .
+          This is the cause of the "insufficient permission" git errors.
+
+  - Harness count surprisingly low.
+       => check that signatures_pattern.txt for that app is non-empty; if
+          it is empty, the Java side has no `native` methods or jadx failed
+          to extract classes.
+
+Where to go next after the script finishes successfully:
+  -> Part D to inspect one app's generated folder.
+  -> Part E to build the cross-app seed pool.
+
+
+---------- C.5  Stage 5: Build fuzz queue DB ----------
+
+(Already run by run-static-pipeline.sh, but also standalone.)
+
+Command:
+       python3 build_fuzz_queue.py
+
+Output:
+       fuzzing/fuzz.db        <- SQLite DB, table fuzzdata(app TEXT, fname TEXT)
+
+Inspect it:
+       python3 - <<'PY'
+       import sqlite3
+       con = sqlite3.connect("fuzzing/fuzz.db")
+       print("total:", con.execute("SELECT COUNT(*) FROM fuzzdata").fetchone()[0])
+       for row in con.execute("SELECT app, COUNT(*) FROM fuzzdata GROUP BY app"):
+           print(" ", row) python3 - <<'PY'
+       import sqlite3
+       con = sqlite3.connect("fuzzing/fuzz.db")
+       print("total:", con.execute("SELECT COUNT(*) FROM fuzzdata").fetchone()[0])
+       for row in con.execute("SELECT app, COUNT(*) FROM fuzzdata GROUP BY app"):
+           print(" ", row)
+       PY
+       PY
+
+Example output:
+       total: 42
+       ('com.UCMobile.intl', 12)
+       ('com.android.chrome', 20)
+       ('com.google.android.googlequicksearchbox', 10)
+
+Meaning:
+  Each row is one (app, harness) pair that downstream tools can fuzz.
+  `app` matches target_APK/<app>/ folder name.
+  `fname` is the harness folder name (e.g. Java_J_N_M$1c3w6w@arg@0).
+
+
+============================================================
+PART D — Inspect what you have for one app
+============================================================
+
+D.1  Pick one app and one harness:
+
+       APP=com.android.chrome
+       HARN=$(python3 - <<'PY'
+       import sqlite3
+       con = sqlite3.connect("fuzzing/fuzz.db")
+       row = con.execute(
+         "SELECT fname FROM fuzzdata WHERE app=? ORDER BY rowid LIMIT 1",
+         ("com.android.chrome",)
+       ).fetchone()
+       print(row[0] if row else "")
+       PY
+       )
+       echo "APP=$APP"
+       echo "HARN=$HARN"
+
+D.2  Look at what was generated:
+
+       ls target_APK/$APP/harnesses/$HARN/
+
+     Expected:
+       harness.cpp
+       harness_debug.cpp
+       info.json
+       seed_constraints.json
+       seeds/
+
+D.3  Inspect info.json and seeds:
+
+       cat target_APK/$APP/harnesses/$HARN/info.json
+       ls  target_APK/$APP/harnesses/$HARN/seeds/ | head
+
+
+============================================================
+PART E — Build the cross-app SEED POOL (shared by Novelty 1)
+============================================================
+
+Command:
+       python3 tools/build_seed_pool.py
+
+Output:
+       results/seed_pool.json
+
+Quick stats:
+       python3 -c "import json; d=json.load(open('results/seed_pool.json')); \
+           print('signature_keys=', d.get('count_keys'), \
+                 'harnesses=',      d.get('count_harnesses'))"
+
+Example:
+       signature_keys= 18 harnesses= 42
+
+Meaning:
+  - A "signature_key" is ret_type + arg_types (e.g. 'jstring|jint,jbyteArray').
+  - Every harness in the repo is indexed by this key so Novelty 1 can
+    transfer seeds between harnesses that share the same JNI shape.
+
+
+============================================================
+PART F — Run one host fuzz session (end-to-end smoke test)
+============================================================
+
+F.1  Command with real app/harness (degraded mode, because the ARM VM
+     cannot load Android's libart.so; see Part K for details):
+
+       APP=com.android.chrome
+       HARN='Java_J_N_M$1c3w6w@@0'    # pick one from your DB
+
+       python3 fuzzing/host_fuzz.py \
+           --target "$APP" \
+           --target_function "$HARN" \
+           -t 60 \
+           --rebuild \
+           --seed-source local+transfer \
+           --skip-preflight
+
+F.2  Expected tail of stdout (JSON summary):
+       {
+         "app": "com.android.chrome",
+         "harness": "Java_J_N_M$1c3w6w@@0",
+         "duration_seconds": 60,
+         "executions": 1014,
+         "crashes": 1014,
+         "output_dir": "/mnt/target_APK/com.android.chrome/fuzzing_output_host/Java_J_N_M$1c3w6w@@0/output_host_20260427_221500",
+         "seed_stats": {"local_seed_files": 10, "transfer_seed_files": 3, "selected_seed_files": 10},
+         "mutation_mode": "structured",
+         "seed_parse_success_rate": 1.0
+       }
+
+F.3  Per-run output folder:
+       target_APK/com.android.chrome/fuzzing_output_host/Java_J_N_M$1c3w6w@@0/output_host_<timestamp>/
+           summary.json       <- same JSON as stdout
+           crashes/           <- raw crashing input bytes
+           queue/             <- interesting inputs
+           logs/              <- *.stderr.txt + *.stdout.txt per crash
+
+F.4  How to read logs (single quotes matter, '$' in harness names):
+
+       set +H                                                 # disable ! expansion
+       HARN='Java_J_N_M$1c3w6w@@0'
+       LATEST=$(ls -dt "target_APK/com.android.chrome/fuzzing_output_host/${HARN}"/output_host_* | head -1)
+       ls "$LATEST/logs" | head
+       cat "$LATEST/logs/$(ls "$LATEST/logs" | head -1)"
+
+     In degraded mode most logs will contain exactly one line:
+       libart.so: cannot open shared object file: No such file or directory
+
+     That is expected and is the environmental limitation to document.
+
+
+============================================================
+PART G — Novelty 1: Cross-App Seed Transfer (deep dive)
+============================================================
+
+Motivation:
+  The per-harness initial corpus has only ~5-10 seeds from seed_generator.py.
+  That is too small. Many harnesses across the repo share the same JNI
+  signature (e.g. 'jstring|jint,jbyteArray'); seeds that worked for one
+  signature-compatible harness are likely valid, non-trivial inputs for
+  another. We build a central pool and reuse seeds cross-app.
+
+Novelty 1a — Naive transfer:
+  Copy seeds from every signature-compatible harness into the target's
+  seeds_transfer/ folder. No probing. Pure structural matching.
+
+Novelty 1b — Coverage-guided transfer:
+  Probe each candidate seed once on the target harness. Compute a behavior
+  fingerprint. Keep only seeds whose fingerprint is new versus local seeds
+  and already-accepted seeds. Diversity-maximised subset.
+
+Fingerprint (1b):
+  fp = crash_kind | stdout_bucket | stderr_bucket | duration_bucket
+       | first 3 normalised stderr lines
+  Addresses -> 0xADDR, long numbers -> NUM.
+  Length buckets: 0, xs<64, s<1k, m<16k, l>=16k.
+  Duration buckets: <0.1s, <0.5s, <1s, <3s, >=3s.
+
+
+---------- G.1  Apply naive transfer ----------
+
+Command:
+       APP=com.android.chrome
+       HARN='Java_J_N_M$1c3w6w@@0'
+       python3 tools/apply_seed_transfer.py --app "$APP" --harness "$HARN" --clean
+
+Expected output (one line):
+       [SEED-TRANSFER] com.android.chrome/Java_J_N_M$1c3w6w@@0 key=jstring|jint,jbyteArray copied=3
+       [SEED-TRANSFER] done targets=1 total_copied=3
+
+Meaning:
+  - "key=..." is the JNI signature group.
+  - "copied=N" is how many cross-app seeds were placed in seeds_transfer/.
+  - With --clean, seeds_transfer/ was wiped and repopulated.
+
+Output folder:
+       target_APK/com.android.chrome/harnesses/Java_J_N_M$1c3w6w@@0/seeds_transfer/
+           com.whatsapp__Java_X$abc__seed_0.bin
+           com.spotify__Java_Y$cde__seed_2.bin
+           ...
+
+
+---------- G.2  Apply coverage-guided transfer ----------
+
+Command:
+       python3 tools/coverage_guided_transfer.py \
+           --app "$APP" --harness "$HARN" --clean --skip-preflight
+
+Expected output (trimmed):
+       [CG-TRANSFER] app=com.android.chrome harness=Java_J_N_M$1c3w6w@@0 key=jstring|jint,jbyteArray
+       [CG-TRANSFER] candidate sources=5
+       [CG-TRANSFER] compiling target harness
+       [CG-TRANSFER] probing 10 local seed(s) for baseline behavior
+       [CG-TRANSFER] accepted=3 rejected_duplicate=28 rejected_error=0 rejected_same_app=0
+       [CG-TRANSFER] provenance: /mnt/target_APK/.../seeds_transfer/_provenance.json
+       [CG-TRANSFER] summary:    /mnt/results/coverage_guided_transfer_com.android.chrome_Java_J_N_M$1c3w6w@@0_20260427_221622.json
+
+Meaning:
+  - "accepted=3" : only 3 of 31 candidate seeds produced a NEW fingerprint.
+  - "rejected_duplicate=28" : 28 candidates produced the same behavior
+     as local seeds or earlier-accepted seeds -> correctly discarded.
+  - This shows the filter is doing real work (collapses redundant seeds).
+
+Outputs:
+       target_APK/<APP>/harnesses/<HARN>/seeds_transfer/<kept seeds>
+       target_APK/<APP>/harnesses/<HARN>/seeds_transfer/_provenance.json
+       results/coverage_guided_transfer_<APP>_<HARN>_<ts>.json
+
+
+---------- G.3  Three-way evaluation (baseline / naive / CG) ----------
+
+Command:
+       python3 tools/eval_seed_transfer.py \
+           --app "$APP" --harness "$HARN" --time 60 --skip-preflight
+
+Expected output (trimmed):
+       [EVAL] setting up method=baseline
+       [EVAL] running method=baseline seed_source=local
+       [EVAL] setting up method=naive_transfer
+       [EVAL] running method=naive_transfer seed_source=local+transfer
+       [EVAL] setting up method=coverage_guided_transfer
+       [EVAL] running method=coverage_guided_transfer seed_source=local+transfer
+       [EVAL] quick comparison
+       {
+         "baseline":                  {"executions": 1014, "crashes": 1014, "transfer_seed_files": 0},
+         "naive_transfer":            {"executions": 1015, "crashes": 1015, "transfer_seed_files": 3},
+         "coverage_guided_transfer":  {"executions": 1016, "crashes": 1016, "transfer_seed_files": 3}
+       }
+
+Artifacts:
+       results/seed_transfer_eval_<ts>.csv
+       results/seed_transfer_eval_<ts>.json
+       results/seed_transfer_triage_<ts>.csv
+       results/seed_transfer_triage_<ts>.json
+
+Interpreting numbers in DEGRADED mode:
+  - executions/crashes are nearly identical -> expected, every JNI call
+    aborts on loader error (libart.so missing).
+  - transfer_seed_files is the most meaningful field here:
+      baseline              -> 0  (only local seeds used)
+      naive_transfer        -> 3  (signature-only copies)
+      coverage_guided       -> 3  (diverse subset)
+  - unique_clusters (from triage) -> 1 everywhere; single env cluster.
+
+What you put on slides from this:
+  - Table: method | execs | crashes | transfer_seed_files | clusters.
+  - Caption: "Equal budget, same fuzzer; CG keeps a diverse subset of
+     cross-app seeds; in degraded mode all methods collapse to a single
+     environment cluster, proving the triage step works and bounding the
+     limitation."
+
+
+============================================================
+PART H — Novelty 2: Adaptive Top-K Harness Budgeting (deep dive)
+============================================================
+
+Motivation:
+  Not all harnesses are equally productive. Uniform budget wastes effort.
+  Pilot every candidate briefly, score them, run full budget only on top-K,
+  and compare head-to-head against queue-order (baseline) selection at the
+  same total budget.
+
+Score function (adaptive_harness_scheduler.py):
+       score = crashes + 0.001 * executions + 0.1 * seed_parse_success_rate
+  - crashes dominate (our main signal).
+  - executions tie-break (faster harness has more potential).
+  - parser stability tie-break (well-formed harness).
+
+
+---------- H.1  Run the scheduler ----------
+
+Command:
+       APP1=com.android.chrome
+       python3 tools/adaptive_harness_scheduler.py \
+           --app "$APP1" \
+           --candidate-limit 6 \
+           --top-k 3 \
+           --pilot-time 20 \
+           --full-time 60 \
+           --seed-source local+transfer \
+           --skip-preflight
+
+Expected output (trimmed):
+       [ADAPTIVE] candidates=6 app=com.android.chrome
+       [ADAPTIVE] pilot 1/6 harness=Java_J_N_MZWMOP4I@@0
+       [ADAPTIVE] pilot 2/6 harness=Java_J_N_M$1c3w6w@@0
+       ...
+       [ADAPTIVE] baseline_selected=['Java_...ZWMOP4I@@0', 'Java_...$1c3w6w@@0', 'Java_...']
+       [ADAPTIVE] adaptive_selected=['Java_...@arg@0', 'Java_...@cs@0', 'Java_...']
+       [ADAPTIVE] baseline full rank=1 harness=...
+       [ADAPTIVE] adaptive full rank=1 harness=...
+       ...
+       [ADAPTIVE] comparison
+       {
+         "baseline_total_crashes":    3042,
+         "adaptive_total_crashes":    3185,
+         "baseline_total_executions": 3042,
+         "adaptive_total_executions": 3185
+       }
+
+Artifacts:
+       results/adaptive_budget_eval_<ts>.csv        (row per run: pilot + full)
+       results/adaptive_budget_eval_<ts>.json       (rows + summary + selections)
+       results/adaptive_budget_triage_<ts>.csv
+       results/adaptive_budget_triage_<ts>.json
+
+CSV row schema:
+       run_id, strategy(adaptive|baseline), phase(pilot|full),
+       app, harness, rank, score,
+       duration_seconds, seed_source,
+       executions, crashes,
+       selected_seed_files, local_seed_files, transfer_seed_files,
+       seed_parse_success_rate, output_dir
+
+
+---------- H.2  What to show on slides ----------
+
+  - Pilot scoreboard table (top 5 by score).
+  - Baseline picks vs Adaptive picks (show the different harness sets).
+  - Bar chart: total crashes, total executions, unique clusters per strategy.
+  - Caption: "Equal total budget = top_k * full_time. Only the selection
+     policy differs. Adaptive finds more real bugs once runtime libs work."
+
+
+============================================================
+PART I — Novelty 3: Integrated Crash Triage (deep dive)
+============================================================
+
+Motivation:
+  Raw crash count is misleading. 1014 crashes might be 1 bug hit 1014 times
+  or 1014 distinct bugs. Triage clusters raw crash logs into unique root
+  causes by normalising noisy details and hashing the signature.
+
+Normalisation:
+  - Hex addresses: 0x... -> 0xADDR
+  - Long numbers: 5+ digits -> NUM
+  - First N non-empty stderr lines -> cluster signature key.
+
+Already auto-invoked by eval_seed_transfer.py and adaptive_harness_scheduler.py.
+Can also be run standalone.
+
+
+---------- I.1  Standalone triage for one app ----------
+
+Command:
+       python3 tools/triage_host_crashes.py --app com.android.chrome
+
+Expected output (trimmed):
+       [TRIAGE] scanned X output_host_* dirs
+       [TRIAGE] total stderr logs: 2028
+       [TRIAGE] clusters: 1
+       [TRIAGE] wrote results/host_crash_triage_<ts>.csv
+       [TRIAGE] wrote results/host_crash_triage_<ts>.json
+
+CSV columns:
+       cluster_id, count, signals, apps, harnesses, signature, sample_stderr
+
+Example row:
+       C0001,2028,SIGABRT,com.android.chrome,Java_J_N_M$1c3w6w@@0,
+       SIGABRT|libart.so: cannot open shared object file: No such file or directory,
+       /mnt/target_APK/com.android.chrome/fuzzing_output_host/Java_J_N_M$1c3w6w@@0/output_host_.../logs/id_000000_signal_SIGABRT.bin.stderr.txt
+
+Meaning:
+  - cluster_id  : internal id for the unique root cause.
+  - count       : how many raw crashes fell into this cluster.
+  - signals     : kernel signals seen (SIGABRT, SIGSEGV, ...).
+  - apps/harns  : which apps/harnesses contributed.
+  - signature   : normalised textual fingerprint.
+  - sample_stderr : path to one representative stderr file.
+
+Thesis framing:
+  In degraded mode you will have cluster=1 (the libart loader failure).
+  That is exactly what triage is supposed to reveal: 2028 raw crashes
+  really were 1 environment bug. Once runtime libs load, the triage will
+  separate real bugs automatically using the same logic.
+
+
+============================================================
+PART J — Aggregate everything for the presentation
+============================================================
+
+Command:
+       python3 tools/collect_results.py
+
+Expected stdout (summary.txt printed):
+       Seed Pool
+       ---------
+         signature_keys:    18
+         total_harnesses:   42
+         top-5 most-shared signature keys:
+             14  jstring|jint,jbyteArray
+             ...
+
+       Novelty 1 — Seed Transfer Comparison
+       ------------------------------------
+       method                       runs   execs  raw_cr  uniq  ex/s   cr/s
+       baseline                        1    1014    1014    1   16.90  16.90
+       naive_transfer                  1    1015    1015    1   16.92  16.92
+       coverage_guided_transfer        1    1016    1016    1   16.94  16.94
+
+       Novelty 1b — Coverage-Guided Decisions
+       --------------------------------------
+       app              harness         probed accept dup sameapp err
+       com.android.... Java_J_N_M$...       31      3  28       0   0
+
+       Novelty 2 — Adaptive Top-K
+       --------------------------
+         app:              com.android.chrome
+         candidate_limit:  6
+         top_k:            3
+         pilot_time:       20s
+         full_time:        60s
+         baseline_selected: H1, H2, H3
+         adaptive_selected: H6, H4, H1
+         strategy   runs   execs  crashes
+         baseline      3    3042    3042
+         adaptive      3    3185    3185
+
+       Novelty 3 — Crash Triage
+       ------------------------
+       file                                      rows uniq_sig apps harn
+       seed_transfer_triage_<ts>.csv                1        1    1    1
+       adaptive_budget_triage_<ts>.csv              1        1    1    3
+
+Output folder (paste from here into PPT):
+       results/_presentation/
+           summary.txt
+           summary.md
+           seed_transfer_table.csv
+           coverage_guided_table.csv
+           adaptive_table.csv
+           triage_table.csv
+
+
+============================================================
+PART J.5 — Results folder map (where to find every artifact)
+============================================================
+
+After running everything in this SOP, this is what `results/` will contain.
+Each file is listed with which command produced it, what's inside, and
+the quickest way to view it.
+
+---------- J.5.1  Top-level layout ----------
+
+       results/
+         seed_pool.json                                  (Part E)
+         seed_transfer_eval_<ts>.csv                     (Part G.3)
+         seed_transfer_eval_<ts>.json                    (Part G.3)
+         seed_transfer_triage_<ts>.csv                   (Part G.3)
+         seed_transfer_triage_<ts>.json                  (Part G.3)
+         coverage_guided_transfer_<APP>_<HARN>_<ts>.json (Part G.2)
+         adaptive_budget_eval_<ts>.csv                   (Part H.1)
+         adaptive_budget_eval_<ts>.json                  (Part H.1)
+         adaptive_budget_triage_<ts>.csv                 (Part H.1)
+         adaptive_budget_triage_<ts>.json                (Part H.1)
+         host_crash_triage_<ts>.csv                      (Part I.1)
+         host_crash_triage_<ts>.json                     (Part I.1)
+         _presentation/                                  (Part J)
+             summary.txt
+             summary.md
+             seed_transfer_table.csv
+             coverage_guided_table.csv
+             adaptive_table.csv
+             triage_table.csv
+
+`<ts>` is a UTC timestamp like 20260427_221500. Multiple runs leave
+multiple files; collect_results.py automatically picks the latest of
+each kind.
+
+
+---------- J.5.2  Quick "what's the latest" listing ----------
+
+       ls -lt results/ | head -40
+
+       # only the latest of every kind:
+       for prefix in seed_pool seed_transfer_eval seed_transfer_triage \
+                     coverage_guided_transfer \
+                     adaptive_budget_eval adaptive_budget_triage \
+                     host_crash_triage; do
+         f=$(ls -1t results/${prefix}*.* 2>/dev/null | head -1)
+         [ -n "$f" ] && echo "$f"
+       done
+
+
+---------- J.5.3  Files for the SEED POOL (Part E) ----------
+
+       results/seed_pool.json
+
+  What is inside:
+       {
+         "count_keys": 18,
+         "count_harnesses": 42,
+         "entries": [
+           {"app": "...", "harness": "...", "signature_key": "jstring|jint,jbyteArray", "seed_files": [...]},
+           ...
+         ],
+         "pool": {
+           "jstring|jint,jbyteArray": [{"app":"...", "harness":"...", "seed_files":[...]}, ...],
+           ...
+         }
+       }
+
+  Quick view:
+       python3 -c "import json; d=json.load(open('results/seed_pool.json')); \
+           print('keys:', d['count_keys'], 'harnesses:', d['count_harnesses']); \
+           print('top-5:', sorted(((len(v),k) for k,v in d['pool'].items()), reverse=True)[:5])"
+
+  PPT use:
+       Slide 4 (dataset / cross-app coverage).
+
+
+---------- J.5.4  Files for NOVELTY 1 (Part G.3 + G.2) ----------
+
+       results/seed_transfer_eval_<ts>.csv
+       results/seed_transfer_eval_<ts>.json
+       results/seed_transfer_triage_<ts>.csv
+       results/seed_transfer_triage_<ts>.json
+       results/coverage_guided_transfer_<APP>_<HARN>_<ts>.json
+
+  seed_transfer_eval_<ts>.csv columns:
+       run_id, method(baseline|naive_transfer|coverage_guided_transfer),
+       app, harness, duration_seconds, executions, crashes,
+       seed_source, local_seed_files, transfer_seed_files,
+       selected_seed_files, seed_parse_success_rate, output_dir
+
+  Quick view:
+       column -ts, < results/seed_transfer_eval_<ts>.csv | less -S
+       cat results/seed_transfer_eval_<ts>.json | python3 -m json.tool | less
+
+  seed_transfer_triage_<ts>.csv columns:
+       cluster_id, count, signals, apps, harnesses, signature, sample_stderr
+
+  Quick view (top clusters):
+       column -ts, < results/seed_transfer_triage_<ts>.csv | head -20
+
+  coverage_guided_transfer_*.json (per-decision audit trail):
+       Quick stats:
+       python3 -c "import json,sys,glob; \
+         f=sorted(glob.glob('results/coverage_guided_transfer_*.json'))[-1]; \
+         d=json.load(open(f)); \
+         print(f); \
+         print('accepted=', d['accepted'], 'rej_dup=', d['rejected_duplicate'], \
+               'rej_sameapp=', d['rejected_same_app'], 'rej_err=', d['rejected_error']); \
+         print('unique_baseline_fps=', d['unique_baseline_fps'], \
+               'unique_total_fps=', d['unique_total_fps'])"
+
+  Per-decision details (which seed accepted/rejected, with fingerprint):
+       python3 -m json.tool results/coverage_guided_transfer_*.json | less
+
+  PPT use:
+       Slide 5 (CG decisions table — coverage_guided_table.csv).
+       Slide 6 (3-way comparison — seed_transfer_eval_<ts>.csv).
+       Slide 8 (cluster counts — seed_transfer_triage_<ts>.csv).
+
+
+---------- J.5.5  Files for NOVELTY 2 (Part H.1) ----------
+
+       results/adaptive_budget_eval_<ts>.csv
+       results/adaptive_budget_eval_<ts>.json
+       results/adaptive_budget_triage_<ts>.csv
+       results/adaptive_budget_triage_<ts>.json
+
+  adaptive_budget_eval_<ts>.csv columns (already shown in Part H.1).
+
+  adaptive_budget_eval_<ts>.json shape:
+       {
+         "summary": {
+           "run_id": "...", "app": "...", "candidate_limit": 6, "top_k": 3,
+           "pilot_time": 20, "full_time": 60,
+           "baseline_full":  {"runs": 3, "total_executions": 3042, "total_crashes": 3042},
+           "adaptive_full":  {"runs": 3, "total_executions": 3185, "total_crashes": 3185},
+           "baseline_selected": ["H1", "H2", "H3"],
+           "adaptive_selected": ["H6", "H4", "H1"]
+         },
+         "rows": [ <one entry per pilot/full run>, ... ]
+       }
+
+  Quick view:
+       python3 -c "import json,sys,glob; \
+         f=sorted(glob.glob('results/adaptive_budget_eval_*.json'))[-1]; \
+         d=json.load(open(f))['summary']; print(json.dumps(d, indent=2))"
+
+       column -ts, < results/adaptive_budget_eval_<ts>.csv | less -S
+
+  Pilot scoreboard (top 5 by score):
+       python3 -c "import json,glob; \
+         f=sorted(glob.glob('results/adaptive_budget_eval_*.json'))[-1]; \
+         rows=json.load(open(f))['rows']; \
+         pilots=[r for r in rows if r['phase']=='pilot']; \
+         pilots.sort(key=lambda r: float(r.get('score') or 0), reverse=True); \
+         [print(round(r['score'],2), r['crashes'], r['executions'], r['harness']) for r in pilots[:5]]"
+
+  PPT use:
+       Slide 7 (baseline vs adaptive bar chart, pilot scoreboard).
+
+
+---------- J.5.6  Files for NOVELTY 3 (Part I.1) ----------
+
+       results/host_crash_triage_<ts>.csv
+       results/host_crash_triage_<ts>.json
+
+  CSV columns:
+       cluster_id, count, signals, apps, harnesses, signature, sample_stderr
+
+  Quick view (cluster summary):
+       awk -F, 'NR==1 || $2 > 0' results/host_crash_triage_<ts>.csv | column -ts, | less -S
+
+  Open one cluster sample manually:
+       set +H
+       cat "$(awk -F, 'NR==2{print $7}' results/host_crash_triage_<ts>.csv)"
+
+  PPT use:
+       Slide 8 (clusters distilled from raw crashes).
+
+
+---------- J.5.7  Per-run raw outputs (one folder per fuzz run) ----------
+
+These live OUTSIDE results/ but are referenced from every CSV via the
+`output_dir` column. They are the lowest-level evidence for any number.
+
+       target_APK/<APP>/fuzzing_output_host/<HARN>/output_host_<ts>/
+           summary.json       <- same JSON host_fuzz prints to stdout
+           crashes/           <- raw crashing input bytes (id_<n>_signal_*.bin)
+           queue/             <- interesting inputs (only populated under AFL mode)
+           logs/              <- *.stderr.txt + *.stdout.txt per crash
+
+  Quick view of latest run for one harness:
+       set +H
+       APP=com.android.chrome
+       HARN='Java_J_N_M$1c3w6w@@0'
+       LATEST=$(ls -dt "target_APK/$APP/fuzzing_output_host/${HARN}"/output_host_* | head -1)
+       echo "$LATEST"
+       cat  "$LATEST/summary.json"
+       ls   "$LATEST/logs" | head
+       cat  "$LATEST/logs/$(ls "$LATEST/logs" | head -1)"
+
+  Why you might open these:
+       - Look at a single failing input.
+       - Confirm a crash signature in the triage CSV.
+       - Investigate a specific harness whose pilot score looked surprising.
+
+
+---------- J.5.8  Presentation folder (the only thing you copy out) ----------
+
+       results/_presentation/
+           summary.txt                     (full plain-text report)
+           summary.md                      (Markdown / Notion friendly)
+           seed_transfer_table.csv         (Slide: Novelty 1 — 3-way table)
+           coverage_guided_table.csv       (Slide: Novelty 1b accept/reject per harness)
+           adaptive_table.csv              (Slide: Novelty 2 baseline vs adaptive)
+           triage_table.csv                (Slide: Novelty 3 cluster counts)
+
+  Open the report:
+       cat results/_presentation/summary.txt
+
+  Open every table at once:
+       for f in results/_presentation/*.csv; do
+         echo "==== $f ===="; column -ts, "$f"; echo
+       done
+
+  Pack for transfer to laptop (run in host shell, outside container):
+       cd ~/sofuzz-v1
+       tar czf presentation_results.tgz results/_presentation \
+           results/seed_pool.json \
+           results/seed_transfer_eval_*.csv results/seed_transfer_eval_*.json \
+           results/seed_transfer_triage_*.csv results/seed_transfer_triage_*.json \
+           results/coverage_guided_transfer_*.json \
+           results/adaptive_budget_eval_*.csv results/adaptive_budget_eval_*.json \
+           results/adaptive_budget_triage_*.csv results/adaptive_budget_triage_*.json
+       ls -lh presentation_results.tgz
+
+
+---------- J.5.9  Mapping of "ran X" -> "look at Y" ----------
+
+       Action                                            Where the result is
+       --------------------------------------------------------------------
+       ./run-static-pipeline.sh                          target_APK/<APP>/static_analysis/*
+                                                         target_APK/<APP>/harnesses/*
+                                                         fuzzing/fuzz.db
+       python3 tools/build_seed_pool.py                  results/seed_pool.json
+       python3 tools/apply_seed_transfer.py              target_APK/<APP>/harnesses/<H>/seeds_transfer/*
+       python3 tools/coverage_guided_transfer.py         target_APK/<APP>/harnesses/<H>/seeds_transfer/_provenance.json
+                                                         results/coverage_guided_transfer_<APP>_<H>_<ts>.json
+       python3 fuzzing/host_fuzz.py                      target_APK/<APP>/fuzzing_output_host/<H>/output_host_<ts>/*
+       python3 tools/eval_seed_transfer.py               results/seed_transfer_eval_<ts>.csv|.json
+                                                         results/seed_transfer_triage_<ts>.csv|.json
+       python3 tools/adaptive_harness_scheduler.py       results/adaptive_budget_eval_<ts>.csv|.json
+                                                         results/adaptive_budget_triage_<ts>.csv|.json
+       python3 tools/triage_host_crashes.py              results/host_crash_triage_<ts>.csv|.json
+       python3 tools/collect_results.py                  results/_presentation/*
+
+
+============================================================
+PART K — Android runtime libs (optional, to escape degraded mode)
+============================================================
+
+Why: the preflight needs libart.so + libandroid_runtime.so to be loadable.
+On an ARM Ubuntu VM this is blocked by bionic<->glibc incompatibility (our
+documented thesis limitation). Still, here is the setup in case you try.
+
+Host shell (outside container), one time:
+       cd ~/sofuzz-v1
+       sudo docker pull redroid/redroid:11.0.0-latest
+       sudo docker create --name pull_all redroid/redroid:11.0.0-latest >/dev/null
+       sudo docker export pull_all | tar -x -C /tmp \
+           system/apex/com.android.art.debug/lib64 \
+           system/apex/com.android.runtime/lib64/bionic \
+           system/lib64 system/lib64/bootstrap
+       sudo docker rm pull_all >/dev/null
+       mkdir -p android_runtime_libs
+       cp /tmp/system/apex/com.android.art.debug/lib64/*.so android_runtime_libs/ 2>/dev/null
+       cp -n /tmp/system/apex/com.android.runtime/lib64/bionic/*.so android_runtime_libs/ 2>/dev/null
+       cp -n /tmp/system/lib64/bootstrap/*.so android_runtime_libs/ 2>/dev/null
+       cp -n /tmp/system/lib64/*.so android_runtime_libs/ 2>/dev/null
+       sudo chown -R $USER:$USER android_runtime_libs
+
+Inside the container, every time:
+       export LD_LIBRARY_PATH="/mnt/android_runtime_libs:${LD_LIBRARY_PATH}"
+
+If preflight still fails, drop --skip-preflight when available, or keep
+using it to run in degraded mode. The known terminal error
+"/lib/aarch64-linux-gnu/libm.so: invalid ELF header" is the bionic/glibc
+wall; treat it as a thesis limitation.
+
+
+============================================================
+PART L — End-to-end cheatsheet (copy-paste block)
+============================================================
+
+       # 0) one-time
+       cd ~/sofuzz-v1
+       sudo chown -R $USER:$USER ~/sofuzz-v1
+       sudo ./run.sh                                     # enter container
+
+       # inside container
+       cat > apks.txt <<'EOF'
+       com.UCMobile.intl
+       com.android.chrome
+       com.google.android.googlequicksearchbox
+       EOF
+
+       # 1) static + harness generation (if QSB OOMs, bump heap and retry)
+       ./run-static-pipeline.sh
+       # retry QSB if it OOM'd:
+       export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"
+       python3 static_analysis/preprocess.py --target com.google.android.googlequicksearchbox --argument_analysis    --static_only
+       python3 static_analysis/preprocess.py --target com.google.android.googlequicksearchbox --callsequence_analysis --static_only
+       # then re-generate harnesses for QSB only:
+       grep '^com\.google\.android\.googlequicksearchbox$' apks.txt > /tmp/qsb.txt
+       APKS=/tmp/qsb.txt HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -ct_argval -fuzz --afl_coverage_on" python3 generate_harnesses_batch.py
+       APKS=/tmp/qsb.txt HARNESS_GEN_FLAGS="-jo_ok -cs_ph -cs_io -cs_ph_min_len 1 -fuzz --afl_coverage_on"            python3 generate_harnesses_batch.py
+       APKS=/tmp/qsb.txt HARNESS_GEN_FLAGS="-jo_ok -ct_argval -fuzz --afl_coverage_on"                                 python3 generate_harnesses_batch.py
+       APKS=/tmp/qsb.txt HARNESS_GEN_FLAGS="-jo_ok -fuzz --afl_coverage_on"                                            python3 generate_harnesses_batch.py
+       python3 build_fuzz_queue.py
+
+       # 2) seed pool
+       python3 tools/build_seed_pool.py
+
+       # 3) Novelty 1 (eval 3-way) + Novelty 3 (auto triage)
+       APP=com.android.chrome
+       HARN='Java_J_N_M$1c3w6w@@0'
+       python3 tools/eval_seed_transfer.py --app "$APP" --harness "$HARN" --time 60 --skip-preflight
+
+       # 4) Novelty 2 (adaptive) + Novelty 3 (auto triage)
+       python3 tools/adaptive_harness_scheduler.py --app "$APP" --candidate-limit 6 --top-k 3 --pilot-time 20 --full-time 60 --seed-source local+transfer --skip-preflight
+
+       # 5) optional global triage across all runs for this app
+       python3 tools/triage_host_crashes.py --app "$APP"
+
+       # 6) aggregate everything for the PPT
+       python3 tools/collect_results.py
+       ls results/_presentation/
+       cat results/_presentation/summary.txt
+
+       # 7) leave container and package for laptop
+       exit
+       cd ~/sofuzz-v1
+       tar czf presentation_results.tgz results/_presentation \
+           results/seed_pool.json \
+           results/seed_transfer_eval_*.csv results/seed_transfer_eval_*.json \
+           results/seed_transfer_triage_*.csv results/seed_transfer_triage_*.json \
+           results/coverage_guided_transfer_*.json \
+           results/adaptive_budget_eval_*.csv results/adaptive_budget_eval_*.json \
+           results/adaptive_budget_triage_*.csv results/adaptive_budget_triage_*.json
+       ls -lh presentation_results.tgz
+
+
+============================================================
+PART M — Common errors and fixes
+============================================================
+
+1) git pull: "insufficient permission for adding an object to repository database"
+     sudo chown -R $USER:$USER ~/sofuzz-v1
+     git config --global --add safe.directory /home/$USER/sofuzz-v1
+     git pull
+
+2) adaptive scheduler: "No harnesses found in DB for app="
+     Variables lost when re-entering container. Re-export:
+       APP1=com.android.chrome
+     Or source a file: source /tmp/thesis.env
+
+3) host_fuzz.py: "Host runtime dependency missing: libart.so"
+     Add --skip-preflight for degraded mode, or set up android_runtime_libs
+     (Part K).
+
+4) Soot/FlowDroid OutOfMemoryError
+     export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"
+     Re-run argument_analysis and callsequence_analysis.
+
+5) "bash: !: event not found" when cat-ing crash logs with '$'
+     set +H   # disables history expansion
+     then cat "...Java_J_N_M$1c3w6w@@0..."
+
+6) Permission denied writing to results/
+     sudo chown -R $USER:$USER .
+
+End of SOP1.
+
+
+
+
+====My commands ====
+check db:
+
+cd /mnt
+APP=com.google.android.apps.translate
+
+python3 - <<PY
+import sqlite3, os
+con = sqlite3.connect("fuzzing/fuzz.db")
+rows = [r[0] for r in con.execute(
+    "SELECT fname FROM fuzzdata WHERE app=?", ("$APP",)).fetchall()]
+missing = []
+for f in rows:
+    path = f"target_APK/$APP/harnesses/{f}"
+    if not os.path.isdir(path):
+        missing.append(path)
+print(f"in DB: {len(rows)}   missing on disk: {len(missing)}")
+for m in missing[:10]:
+    print("  MISSING:", m)
+PY
+
+

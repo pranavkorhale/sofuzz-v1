@@ -1,0 +1,634 @@
+================================================================================
+SoFuzz — Novelties for MTech Thesis
+A research-style, in-depth description of four contributions
+================================================================================
+
+Author context:
+  This document describes the novel contributions added on top of the SoFuzz
+  baseline (directed JNI fuzzer for stripped Android native code). Each
+  novelty is explained the way a thesis / workshop paper would explain it:
+  problem, prior art, key insight, formalisation, algorithm, implementation,
+  evaluation, threats to validity, and why it is novel.
+
+Contributions covered:
+  N1a. Cross-App JNI Seed Transfer (signature-compatible, "naive")
+  N1b. Coverage-Guided (Behavior-Guided) Seed Transfer (utility-aware)
+  N2.  Adaptive Top-K Harness Budgeting (pilot-then-allocate scheduling)
+  N3.  Integrated, Normalised Crash Triage for JNI Harnesses
+
+================================================================================
+PART 0 — Shared background, notation, threat model
+================================================================================
+
+0.1 Target setting.
+    SoFuzz fuzzes JNI entry points of Android applications whose native
+    libraries (.so) are usually stripped of symbols. For each app A we
+    extract a set of JNI methods. For each method we generate a C++ harness
+    program H = (A, m) that (i) parses raw bytes from a seed/mutant into the
+    JNI argument types of m, and (ii) invokes m. We then run these harnesses
+    under a blackbox / structured-mutation fuzzer on the host.
+
+0.2 Notation.
+      A                      an Android application (APK).
+      m                      a JNI method inside A.
+      H = (A, m)             a harness bound to (A, m).
+      sig(H) = (tret, targs) the JNI signature (return type, tuple of arg types)
+                             expressed at the JNI-ABI level, not at the Java
+                             generic-type level.
+      S(H)                   the local seed corpus of H (produced by static
+                             analysis + heuristic seed generator).
+      X(H)                   the set of "transferred" seeds added to H by a
+                             seed-transfer procedure.
+      run(H, T, sigma)       fuzz H for wall-clock time T with seed source
+                             sigma in {local, local+transfer}.
+      summary(H, run)        observable metrics:
+                               execs, crashes, parse_ok_rate,
+                               seed file counts, output folder.
+      log(H, run)            per-crash stderr logs captured during the run.
+
+0.3 Threat model and platform limitation.
+    The reference platform for this thesis is an ARM Ubuntu VM running the
+    SoFuzz Docker container in "host-fuzz" mode. Full runtime execution of
+    JNI requires Android Bionic, libart, and libandroid_runtime. On a glibc
+    host the dynamic loader cannot mix bionic-linked libart with glibc libc,
+    producing errors like "invalid ELF header" on libm. Consequently, in the
+    evaluation here, runs operate in "degraded mode" (preflight skipped):
+    SIGABRTs triggered by missing runtime libraries occur before the target
+    JNI body executes, so raw "crashes" on such a host are NOT valid defect
+    counts. This is a documented environmental constraint, not a novelty
+    flaw. The novelties are defined independently of that constraint; they
+    rank, select, and cluster in the same way when the runtime is available.
+
+0.4 Why this setting needs new techniques.
+    - Harness populations are very large and heterogeneous across apps:
+      typical static analysis yields thousands of (A, m) candidates.
+    - Seeds for JNI are hard to craft: they are raw byte sequences that must
+      survive a type-directed parser inside the harness. A random byte
+      string rarely satisfies even the parser's arity check.
+    - Fuzzing budget is finite; uniformly distributing time across harnesses
+      wastes most of it on harnesses that are parser-saturated or trivial.
+    - Crash logs in this pipeline are noisy: most lines contain addresses,
+      pointer values, thread IDs, or platform-specific tokens that explode
+      the apparent crash count far above the number of real defects.
+    Each novelty below addresses one of these pain points.
+
+
+================================================================================
+PART 1 — Novelty N1a: Cross-App JNI Seed Transfer (signature-compatible)
+================================================================================
+
+1.1 Problem.
+    The parser embedded in each harness expects a very specific byte layout
+    (lengths, tags, arrays of a specific element width). A seed that is
+    valid for one harness rarely parses for another — unless the two
+    harnesses share the same JNI signature, in which case the *parser*
+    layout is identical. Static seed generation (length-prefixed random
+    bytes, bounded integers) produces seeds that parse but do not exercise
+    interesting internal states of the callee. Yet, across thousands of
+    apps in the wild, there frequently exist JNI methods with identical
+    argument shapes: some of them have had non-trivial inputs generated by
+    static analysis of another app. Those inputs are wasted if kept
+    app-local.
+
+1.2 Key insight.
+    At the JNI ABI layer, "signature compatibility" is structural: if
+    sig(H1) == sig(H2), then the *byte-level* parser inside H2 will accept
+    any byte string that H1's parser accepts. This is weaker than semantic
+    compatibility (the callee may behave differently), but it is sufficient
+    to expose H2's mutator to inputs whose structure is already non-trivial
+    — meaning more time is spent inside the target function, not in the
+    parser's reject path.
+
+1.3 Formalisation.
+    Define an equivalence relation on harnesses:
+        H1 ~ H2   iff   sig(H1) == sig(H2)     and   A(H1) != A(H2)
+    (cross-app compatibility).
+
+    Define the transferable pool for a target harness H*:
+        P(H*) = union_{H ~ H*, H != H*} S(H)
+
+    The transferred seed set X(H*) is a (possibly capped, optionally
+    deduplicated) subset of P(H*) copied into H*'s seed directory.
+
+    The fuzz source becomes:
+        sigma = local+transfer  =>  initial corpus = S(H*) U X(H*).
+
+    Correctness. Every s in X(H*) has originally been consumed by a parser
+    with an identical JNI signature; therefore parsing in H* cannot fail
+    for a "shape" reason. Differences in downstream behaviour are exactly
+    what we want — they drive mutation toward uncharted paths of the
+    callee.
+
+1.4 Algorithm (offline phase: build the pool).
+    Inputs:  the set of all generated harnesses.
+    Output:  results/seed_pool.json, keyed by sig-string.
+
+    for each generated harness H = (A, m):
+        read signatures_pattern.txt -> (tret, targs)
+        list files in H/seeds/ -> S(H)
+        key = sig_string(tret, targs)
+        pool[key].append({app: A, harness: m, seed_files: S(H)})
+    persist pool.
+
+1.5 Algorithm (online phase: apply to one target).
+    Inputs:  target H*, pool, cap k (seeds per source harness), seed budget B.
+    Output:  files in H*/seeds_transfer/
+
+    compatible = pool[sig_string(H*)] \ {H*}
+    flatten and optionally deduplicate:
+        candidates = sorted set of (source_A, source_H, seed_file)
+                     with seed_file hashed on content.
+    truncate to B:
+        selected = first B candidates.
+    for each (srcA, srcH, f) in selected:
+        copy to H*/seeds_transfer/<srcA>__<srcH>__<f>
+    also emit H*/seeds_transfer/_provenance.json recording the exact
+    (srcA, srcH, f) of each imported seed.
+
+1.6 Implementation.
+    - Offline builder:    tools/build_seed_pool.py
+    - Online applier:     tools/apply_seed_transfer.py
+    - Consumed by:        fuzzing/host_fuzz.py via --seed-source local+transfer
+    - Evaluator:          tools/eval_seed_transfer.py (--methods baseline,naive_transfer)
+
+1.7 Evaluation protocol.
+    For a fixed (A*, m*) and a fixed wall-clock budget T:
+      run baseline:           sigma = local
+      run naive_transfer:     sigma = local + X(H*) produced as above
+    Report per method:
+      executions, crashes, parse_ok_rate, selected_seed_files,
+      unique crash clusters (see N3), and the output folder for evidence.
+    Repeat across several (A*, m*) to average out variance.
+
+1.8 Why it is novel.
+    JNI fuzzers in the literature (Marvin, JN-Saf, JavaDroid, ARVE, JuCify)
+    treat harnesses per-app; seed corpora do not cross app boundaries.
+    Generic cross-seeding exists in non-Android fuzzing (e.g., AFL++ corpus
+    sharing, OSS-Fuzz's seed corpora, CollAFL, Ensemble Fuzzing), but
+    typically over programs with the same symbol/ABI identity. The novelty
+    here is the use of JNI-ABI signature equivalence — a structural parser
+    property, not a semantic one — as the admission key for cross-app seed
+    flow in stripped Android natives. It is the first seed exchange policy
+    defined at the JNI argument-shape granularity across independent APKs.
+
+1.9 Limitations and threats to validity.
+    - Non-admitted semantic traps: a seed that parses cleanly in H* may
+      still hit a pre-callee validation in the app (magic bytes, auth
+      tokens) and never reach interesting logic. N1a does not detect this.
+    - Signature skew: if the source harness parses a narrower subset of the
+      shared signature (e.g., always uses a fixed "version" byte), its
+      seeds under-exercise H*. N1a cannot correct for this without
+      behavioural feedback. Novelty N1b is the direct remedy.
+    - Deduplication is file-hash-based; two functionally identical seeds
+      with different padding remain separate.
+
+
+================================================================================
+PART 2 — Novelty N1b: Coverage-Guided (Behavior-Guided) Seed Transfer
+================================================================================
+
+2.1 Problem with pure N1a.
+    N1a transfers every signature-compatible seed. Many of these are
+    redundant: they reduce to the same execution behaviour in H* (e.g.,
+    the same "parser-accepted then fast-return" path). They inflate the
+    corpus, stretch mutation cycles, and dilute the fuzzer's attention.
+
+2.2 Key insight.
+    A *black-box* proxy for coverage still exists in this pipeline: the
+    harness emits stdout/stderr with diagnostic messages, the binary can
+    exit normally, with SIGABRT, SIGSEGV, etc., and each run has a
+    measurable wall-clock duration. The composition of these side-channels
+    forms a run fingerprint that — while coarser than edge coverage —
+    partitions seeds into "behaviourally new" vs "behaviourally redundant"
+    on a concrete binary. We admit a transferred seed iff it is new under
+    this fingerprint, defining a utility-aware admission policy.
+
+2.3 Formalisation.
+    Let phi: (rc, stdout, stderr, duration) -> {0,1}*  be a fingerprint
+    function. For a run producing observable O = (rc, out, err, dt), define:
+
+        phi(O) = H( normalize(rc) ||
+                     bucket(duration) ||
+                     bucket(|out|) ||
+                     bucket(|err|) ||
+                     first-K normalized stderr lines )
+
+    where:
+        normalize(rc)  maps negative signals to their symbolic form
+                       (-6 -> "SIGABRT"), 0 stays as "EXIT0", else "EXITn";
+        bucket(x)      is a monotone quantisation into coarse classes
+                       (e.g., short/long for duration, 0/1/2 for sizes);
+        stderr lines   are canonicalised by removing hex literals, large
+                       numbers, and thread ids (same rule set reused in N3).
+
+    Fingerprint admission test.
+        Let B_fp = { phi(run(H*, T0, s)) : s in S(H*) }   (baseline fps)
+        Let U_fp = B_fp                                    (seen-so-far set)
+        A candidate seed c from the transferable pool is *accepted* iff:
+            phi_c := phi(run(H*, T0, {c}))
+            phi_c not in U_fp
+        If accepted: U_fp := U_fp U {phi_c}  and copy c into X(H*).
+
+    Budget. Each probe uses a short T0 (e.g., 5-10s). We cap the number of
+    candidates examined per target to keep the offline phase bounded.
+    If a candidate crashes with a signature identical to a previously seen
+    baseline crash, it is rejected (not just dropped silently).
+
+2.4 Algorithm.
+    Inputs:  target H*, candidate pool from N1a, T0, max_candidates M.
+    Output:  X(H*) plus a decision trace.
+
+    baseline_fps := empty
+    for each s in S(H*):
+        baseline_fps := baseline_fps U { phi(run(H*, T0, s)) }
+
+    seen := baseline_fps
+    accepted := []
+    rejected := []
+    for (srcA, srcH, c) in candidate_list[:M]:
+        if srcA == A(H*):                     # cross-app only
+            rejected.append((c, "same_app")); continue
+        try:
+            fp := phi(run(H*, T0, {c}))
+        except ProbeError:
+            rejected.append((c, "error"));    continue
+        if fp in seen:
+            rejected.append((c, "duplicate")); continue
+        seen.add(fp); accepted.append((c, fp))
+
+    write X(H*) <- accepted
+    emit coverage_guided_transfer_<A*>_<m*>_<ts>.json with full trace.
+
+2.5 Implementation.
+    - tools/coverage_guided_transfer.py
+    - Integrated into tools/eval_seed_transfer.py as a third arm:
+        methods = {baseline, naive_transfer, coverage_guided_transfer}
+    - Produces both the per-seed decision trace (JSON) and the same
+      aggregate CSV row used by N1a (for direct comparability).
+
+2.6 Evaluation protocol.
+    Three-way comparison on the same target H* with equal total T:
+        (a) sigma = local
+        (b) sigma = local + X_naive(H*)
+        (c) sigma = local + X_cg(H*)
+    Primary metrics:
+        crashes/s, executions/s, parse_ok_rate,
+        unique triage clusters (see N3),
+        |X| (corpus size): expect |X_cg| << |X_naive| with comparable
+        or better yield per unit time.
+    Secondary metrics (from the decision trace):
+        acceptance rate, rejection breakdown
+        (duplicate / same_app / error), unique_baseline_fps,
+        unique_total_fps.
+
+2.7 Why it is novel.
+    Coverage-guided seed scheduling is mature for instrumented binaries
+    (AFL's queue culling, MOpt, PerfFuzz, Ankou). JNI fuzzers typically
+    cannot instrument third-party stripped libraries, so they either fuzz
+    black-box with uniform inputs or rely on app-specific harness authors
+    to curate seeds. This work introduces a *black-box, side-channel*
+    fingerprint as the admission criterion for *cross-app* seeds at the
+    JNI layer — combining the transfer axis of N1a with an on-line
+    utility test. To our knowledge, this specific pairing (cross-app
+    seed flow + behaviour fingerprint admission) has not been used on
+    Android native JNI harnesses.
+
+2.8 Robustness considerations.
+    - Time quantisation: bucketing wall-clock into short/long is coarse
+      but robust across reruns; fine-grained timing would overfit to
+      scheduler noise and inflate uniqueness spuriously.
+    - Stderr canonicalisation: the same normaliser is shared with N3 so
+      that "new behaviour" at admission time corresponds to "new cluster"
+      at triage time; this prevents N1b from accepting seeds that N3
+      would later discard as duplicates.
+    - Probe cost: one short probe per candidate is O(M * T0); M and T0
+      are tunable. Empirically T0 ~ 5s and M ~ 50 keeps the phase under
+      a few minutes per harness.
+
+2.9 Limitations.
+    - Side-channel fingerprints are an under-approximation of coverage.
+      Two inputs hitting different code paths may produce identical
+      fingerprints and one will be rejected.
+    - Conversely, non-deterministic binaries may yield different
+      fingerprints for the same input across reruns; admission becomes
+      time-dependent. Mitigation: repeat probe k times and use majority
+      fingerprint. Not done in the thesis baseline — listed as future work.
+
+
+================================================================================
+PART 3 — Novelty N2: Adaptive Top-K Harness Budgeting
+================================================================================
+
+3.1 Problem.
+    Static analysis yields many harnesses per app; most of them are either
+    (i) parser-saturated (the same parse-accept-fast-return loop) or (ii)
+    boundary-guarded (an early length/magic check rejects everything). A
+    uniform policy — "give every harness the same time" — wastes the
+    majority of the fuzz budget on these uninformative targets. On the
+    other hand, picking harnesses by queue order (as in SoFuzz's default)
+    uses no signal at all.
+
+3.2 Key insight.
+    Even a very short fuzz run (a "pilot") is enough to distinguish
+    clearly useful harnesses from obviously inert ones. By treating the
+    pilot as a *probe* rather than as part of the evaluation, we can
+    reallocate the remaining budget to the top-K pilots. This is a simple
+    two-stage explore-then-exploit policy at the harness granularity.
+
+3.3 Formalisation.
+    Let C = {H_1, ..., H_N} be candidate harnesses for an app (possibly
+    capped by candidate_limit L).  Let T_p be the pilot time and T_f the
+    full-phase time.  Let K be the number of harnesses to promote.
+
+    For H in C, run a pilot and observe:
+        r_H = summary(H, run(H, T_p, local+transfer))
+
+    Score.
+        score(H) = alpha * crashes(r_H)
+                 + beta  * executions(r_H)
+                 + gamma * parse_ok_rate(r_H)
+
+    Defaults used in the implementation:
+        alpha = 1.0, beta = 0.001, gamma = 0.1
+
+    This weights "real findings" highest, then raw throughput (an easy
+    proxy for "the harness actually runs"), then parser stability (the
+    harness is not degenerate on the current corpus).
+
+    Selection.
+        top_K := argmax_{S subseteq C, |S|=K}  sum_{H in S} score(H).
+
+    Full phase (equal-budget contest).
+        adaptive_runs  := { run(H, T_f, local+transfer) : H in top_K }
+        baseline_runs  := { run(H, T_f, local+transfer) : H in first_K(C) }
+
+    Total wall-clock for each arm is exactly K * T_f, plus the shared
+    pilot cost N * T_p.  The only axis that differs is *which* K
+    harnesses are promoted — the contest measures the policy, not the
+    fuzzer.
+
+3.4 Why equal-budget matters.
+    Without the matched-budget design, any "improvement" by adaptive
+    selection could be attributed to spending more compute. The pilot
+    cost is identical for both arms (it precedes both), so the
+    comparison isolates the selection policy.
+
+3.5 Algorithm.
+    1. Enumerate candidates for app A (cap by L).
+    2. For H in candidates: pilot run T_p, record score.
+    3. Sort by score; take top K (adaptive set) and first K by queue
+       order (baseline set).
+    4. Full-run each set at T_f. Record per-run summaries.
+    5. Aggregate:
+         baseline_full:  runs, total_execs, total_crashes
+         adaptive_full:  runs, total_execs, total_crashes
+         baseline_selected: [H_i1, ...]
+         adaptive_selected: [H_j1, ...]
+    6. Feed every run's log folder into N3 (triage) to obtain unique
+       cluster counts per arm.
+
+3.6 Implementation.
+    - tools/adaptive_harness_scheduler.py
+        --candidate-limit L, --top-k K, --pilot-time T_p, --full-time T_f,
+        --seed-source {local, local+transfer}, --skip-preflight.
+    - Emits:
+        results/adaptive_budget_eval_<ts>.csv   (row per pilot/full run)
+        results/adaptive_budget_eval_<ts>.json  (summary + rows + selections)
+        results/adaptive_budget_triage_<ts>.*   (N3 over full-phase logs)
+
+3.7 Evaluation protocol.
+    Fix an app A and budget triple (N, K, T_p, T_f). Run the scheduler
+    once. Compare:
+        baseline_full.total_crashes  vs  adaptive_full.total_crashes
+        baseline_full.total_execs    vs  adaptive_full.total_execs
+        unique_clusters(baseline)    vs  unique_clusters(adaptive)
+    Also plot the pilot scoreboard (top 5 by score) to show that the
+    distribution is heavily skewed — this is itself a finding: uniform
+    budgeting is wasteful because pilot scores span orders of magnitude.
+
+3.8 Why it is novel.
+    Budget allocation across harnesses is a known topic in fuzzing
+    (AFLGo, EcoFuzz, FairFuzz, CollAFL-like schedulers) but it operates
+    *within* a single fuzz campaign and at the input-queue level. Here
+    the policy operates *above* the fuzzer, at the harness level, and
+    targets the Android JNI harness population, which is extreme in its
+    heterogeneity. The explore-then-exploit structure is deliberately
+    minimal — a one-shot top-K instead of a bandit — because pilot cost
+    dominates if done repeatedly, and the practical goal is a defensible
+    scheduling baseline for Android JNI, not a theoretical regret bound.
+
+3.9 Limitations.
+    - Pilots are short; a late-blooming harness (spending T_p in parser
+      set-up, then discovering paths) is under-scored. Mitigation:
+      multiple pilots, or a soft percentile selector. Future work.
+    - Score weights are fixed. In a larger study one would sweep
+      (alpha, beta, gamma).
+    - The baseline is "queue order". Against a uniformly-random
+      baseline the adaptive gap would usually be larger; against an
+      oracle (ideal selection from ground-truth defect count) it would
+      be smaller. The paper should present all three when possible.
+
+
+================================================================================
+PART 4 — Novelty N3: Integrated, Normalised Crash Triage
+================================================================================
+
+4.1 Problem.
+    Host fuzz runs emit one stderr log per crashing input. Two logs that
+    correspond to the same underlying bug commonly differ in:
+      - hex addresses (ASLR),
+      - thread ids,
+      - huge numeric fields (sizes, offsets, pointer-like constants),
+      - temp file paths,
+      - SIGABRT vs SIGSEGV framing lines from libc.
+    Counting raw files therefore overstates defect counts dramatically.
+    Naive top-of-file grouping misclusters because the first line is
+    often the shared libc message, not the unique site.
+
+4.2 Key insight.
+    A deterministic, conservative canonicalisation over the entire
+    stderr text reduces noise without destroying the crash *structure*.
+    The signature for clustering is the concatenation of the signal name
+    plus the first K canonical stderr lines. Two crashes sharing this
+    signature are almost always the same bug; two crashes with different
+    signatures are almost always different. This trades a controlled
+    risk of over-merging (low) for a large reduction in the apparent
+    crash count.
+
+4.3 Normalisation rules (applied to every stderr line).
+    r1.  0x[0-9a-fA-F]+        -> "0xADDR"
+    r2.  [0-9]{5,}              -> "NUM"
+    r3.  /tmp/[a-zA-Z0-9_./-]+  -> "/tmp/PATH"
+    r4.  tid=\d+ / pid=\d+      -> "tid=NUM" / "pid=NUM"
+    r5.  trim trailing whitespace, drop empty lines
+
+    Signature.
+        sig(log) = signal(log) || "|" || first_K_canonical_nonempty_lines
+        cluster_id := H(sig(log))
+
+    The exact K used is 3 by default; it is deliberately small so that
+    two crashes that differ only in deeper-in-stack addresses still
+    cluster together.
+
+4.4 Algorithm.
+    Inputs: root folder containing output_host_<ts>/logs/*.stderr.txt
+    Output: triage CSV + JSON.
+
+    clusters := {}
+    for each stderr file f:
+        sig := signature_of(read(f))
+        cid := hash(sig)
+        clusters[cid].count    += 1
+        clusters[cid].signal    = signal_of(f.name)
+        clusters[cid].apps     .add(parent app)
+        clusters[cid].harnesses.add(parent harness)
+        clusters[cid].signature = sig          # canonicalised text
+        clusters[cid].sample    = f            # one representative
+    sort clusters by count desc, emit CSV/JSON.
+
+    CSV columns (as implemented):
+        cluster_id, count, signals, apps, harnesses, signature, sample_stderr
+
+4.5 Implementation.
+    - tools/triage_host_crashes.py (stand-alone invocation).
+    - Auto-invoked by tools/eval_seed_transfer.py (seed_transfer_triage_*)
+      and tools/adaptive_harness_scheduler.py (adaptive_budget_triage_*).
+    - Canonicaliser deliberately shared with N1b's stderr-line
+      normaliser so that "new behaviour" at admission time aligns with
+      "new cluster" at triage time.
+
+4.6 Evaluation protocol.
+    For each experiment arm, report:
+        raw_crashes, unique_clusters, compression_ratio = raw / unique
+    Additionally:
+        top-5 clusters by size with canonical signature shown
+          — these become the "distinct defect classes" slide.
+        cross-app / cross-harness breadth of each top cluster
+          — a single cluster reproducing across apps suggests a
+          library-level bug or a harness-level regression.
+
+4.7 Why it is novel.
+    Crash deduplication is a well-studied problem (AFL's !crash folder
+    heuristics, BugRedux, StackHash, RETracer, Igor, AURORA). Those
+    systems assume either instrumentation, a symbolicated core dump, or
+    call-stack telemetry. In the JNI-on-stripped-native setting we have
+    neither a symbolicated stack nor reliable per-run instrumentation;
+    we only have process-level stderr and a signal number. N3 is the
+    triage layer tailored to that restricted telemetry, and it is
+    *integrated* into every experiment arm — both N1a/N1b comparisons
+    and the N2 scheduler. Every claim about "crashes" in the thesis is
+    therefore reported twice: raw count and cluster count.
+
+4.8 Limitations.
+    - The canonicaliser cannot merge two bugs whose first K lines
+      differ stylistically but whose root cause is identical
+      (e.g., different assertions from the same invariant).
+    - It cannot split a cluster whose signature is shared by two
+      genuinely different bugs (false merge). K = 3 with signal
+      prefix empirically produces low false-merge rates on the
+      SoFuzz logs, but this is not proven.
+    - In degraded mode (missing Android runtime libs), every crash
+      converges to the same "libart.so not found" cluster; this is
+      precisely the signal the limitation section of the thesis
+      uses to justify reporting cluster counts alongside raw counts.
+
+
+================================================================================
+PART 5 — Relationship diagram (pipeline view)
+================================================================================
+
+                 +-----------------------------+
+                 |  Static analysis + harness  |
+                 |  generation (baseline)      |
+                 +--------------+--------------+
+                                |
+                                v
+                 +-----------------------------+
+                 |  Seeds S(H) per harness     |
+                 +--------------+--------------+
+                                |
+                                v
+     +---------- N1a: Cross-App Signature-Compatible Transfer -----------+
+     |  build_seed_pool.py --> apply_seed_transfer.py                     |
+     |  produces X_naive(H*) for each target                              |
+     +-------------------------------+------------------------------------+
+                                     |
+                                     v
+     +---------- N1b: Coverage-Guided Seed Admission --------------------+
+     |  coverage_guided_transfer.py                                       |
+     |  probes each candidate, keeps only behavior-new seeds              |
+     |  produces X_cg(H*)                                                 |
+     +-------------------------------+------------------------------------+
+                                     |
+                                     v
+     +---------- N2: Adaptive Top-K Budgeting ---------------------------+
+     |  adaptive_harness_scheduler.py                                     |
+     |  pilot --> score --> top_K --> equal-budget adaptive vs baseline   |
+     +-------------------------------+------------------------------------+
+                                     |
+                                     v
+     +---------- N3: Integrated Crash Triage ----------------------------+
+     |  triage_host_crashes.py (also auto-called by eval & scheduler)     |
+     |  raw crashes --> canonical signatures --> unique cluster counts    |
+     +-------------------------------------------------------------------+
+
+Every downstream stage records a CSV/JSON that feeds collect_results.py,
+producing a single presentation-ready bundle in results/_presentation/.
+
+
+================================================================================
+PART 6 — Collective contribution statement (one paragraph each)
+================================================================================
+
+N1a.  We introduce a signature-compatible, cross-app JNI seed-transfer
+      policy for stripped Android native libraries. Seeds flow between
+      apps when and only when their JNI argument shapes match, using the
+      byte-level parser inside each harness as a natural admission gate.
+      This is, to our knowledge, the first seed-exchange policy defined
+      at the JNI ABI granularity across independent APKs.
+
+N1b.  We extend that transfer policy with a black-box, side-channel
+      fingerprint — composed from signal, bucketed run time, bucketed
+      stdio sizes, and canonicalised stderr prefix — that admits a
+      transferred seed only if it induces behaviour not seen on the
+      current target harness. This yields a utility-aware cross-app
+      transfer without requiring any instrumentation of the stripped
+      native library.
+
+N2.   We propose a two-stage harness-level scheduler (pilot-then-
+      allocate top-K) that reallocates fuzzing budget to the few
+      harnesses that measurably matter, under a strictly equal-budget
+      comparison against a queue-order baseline. This moves the
+      budget-allocation question in Android native fuzzing from the
+      input-queue level (well-studied) to the harness-population
+      level (largely unstudied).
+
+N3.   We design a conservative, text-only triage layer specialised for
+      the restricted telemetry available in the JNI-on-stripped-native
+      setting (stderr + signal, no symbols, no call-stack), and
+      integrate it throughout the evaluation so that every reported
+      crash figure is accompanied by a cluster figure. The canonicaliser
+      is intentionally shared with N1b, aligning "new behaviour at
+      admission" with "new cluster at triage".
+
+
+================================================================================
+PART 7 — Reproducibility notes (maps to sop1.txt)
+================================================================================
+
+    N1a:    Parts E, G.1
+    N1b:    Part G.2
+    N1 evaluation (3-way): Part G.3
+    N2:     Part H
+    N3:     Part I
+    Aggregation / presentation: Part J and Part J.5
+    Platform limitation and degraded mode: Part K
+
+All commands in sop1.txt are example-driven with concrete app names,
+and every result file is named and described in Part J.5 so that a
+reviewer can cross-check any number back to its raw source under
+target_APK/<APP>/fuzzing_output_host/<HARN>/output_host_<ts>/.
+
+================================================================================
+END
+================================================================================
