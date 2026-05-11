@@ -1,0 +1,444 @@
+================================================================================
+CHAPTER 3 — BACKGROUND AND PRELIMINARIES
+================================================================================
+
+
+3.1 Introduction
+================================================================================
+
+This chapter establishes the technical background necessary for understanding
+the design and implementation of the proposed JNI fuzzing framework. The
+chapter covers the Android operating system and its application model, the
+Java Native Interface and how it is used in real applications, the concept
+of fuzz testing and coverage-guided fuzzing, static program analysis
+techniques, and the key concepts of seed management and crash triage. Each
+section provides the foundational knowledge required to follow the technical
+contributions described in subsequent chapters.
+
+
+3.2 The Android Application Model
+================================================================================
+
+Android is a Linux-based mobile operating system. Applications are packaged
+as APK files, which are ZIP archives containing compiled bytecode, native
+libraries, resources, and a manifest file.
+
+3.2.1 APK Structure
+
+An APK file contains the following key components:
+
+  - classes.dex: The compiled Java bytecode in Dalvik Executable (DEX)
+    format. Modern APKs may contain multiple DEX files (classes2.dex,
+    classes3.dex) due to the method reference limit.
+  - lib/: Native shared libraries (.so files) organised by CPU architecture
+    (armeabi-v7a, arm64-v8a, x86, x86_64).
+  - AndroidManifest.xml: A binary XML file declaring the application
+    package name, version, permissions, and components.
+  - res/, assets/: Resource files.
+
+3.2.2 The Dalvik/ART Runtime
+
+Android applications execute on the Android Runtime (ART), which replaced
+the original Dalvik virtual machine. ART compiles DEX bytecode to native
+machine code using Ahead-Of-Time (AOT) and Just-In-Time (JIT) compilation.
+The runtime provides managed memory with a garbage collector, reflection,
+class loading, and the JNI bridge.
+
+3.2.3 Native Libraries in Android
+
+Many Android applications, particularly those in multimedia, networking,
+cryptography, and performance-critical domains, implement core functionality
+in C or C++. These native implementations are compiled for each supported
+ABI (Application Binary Interface) and packaged as .so files within the APK.
+When the application is installed, the appropriate native library for the
+device's architecture is extracted and placed in the application's native
+library directory.
+
+
+3.3 The Java Native Interface (JNI)
+================================================================================
+
+The Java Native Interface (JNI) is a standard programming interface that
+allows Java code running in the JVM or ART to call native functions
+implemented in C or C++, and allows native code to call back into the Java
+layer.
+
+3.3.1 Declaring a Native Method
+
+On the Java side, a native method is declared with the `native` modifier
+and no body:
+
+    public class MyClass {
+        public native String processData(byte[] input, int length);
+    }
+
+This declaration instructs the runtime that the implementation is in a
+native library. The method is callable from Java like any other method,
+but dispatched through the JNI bridge.
+
+3.3.2 JNI Function Registration
+
+There are two mechanisms for associating a Java native method with its
+C/C++ implementation.
+
+Static registration follows a naming convention. The native function must
+be named:
+
+    Java_<packagename>_<classname>_<methodname>
+
+For example:
+
+    JNIEXPORT jstring JNICALL
+    Java_com_example_MyClass_processData(JNIEnv* env, jobject thiz,
+                                          jbyteArray input, jint length) { ... }
+
+Dynamic registration uses the `RegisterNatives` function inside `JNI_OnLoad`,
+which the runtime calls when the library is loaded. This allows the developer
+to specify an explicit mapping from method descriptor strings to function
+pointers.
+
+3.3.3 JNI Type System
+
+JNI defines a set of types that correspond to Java types:
+
+    Java Type    | JNI Type
+    -------------|----------
+    boolean      | jboolean
+    byte         | jbyte
+    char         | jchar
+    short        | jshort
+    int          | jint
+    long         | jlong
+    float        | jfloat
+    double       | jdouble
+    String       | jstring
+    byte[]       | jbyteArray
+    int[]        | jintArray
+    Object       | jobject
+
+These mappings define the calling convention used when Java invokes a native
+function.
+
+3.3.4 The JNIEnv Pointer
+
+Every JNI function receives a JNIEnv* pointer as its first argument. This
+pointer provides access to the full JNI function table, which includes
+functions for creating, accessing, and releasing Java objects from native
+code. The second argument is either a jobject (for instance methods) or a
+jclass (for static methods).
+
+3.3.5 Common JNI Operations
+
+Native code commonly performs the following operations through JNI:
+
+  - GetStringUTFChars / ReleaseStringUTFChars: Convert between jstring and
+    C char* strings.
+  - GetByteArrayElements / ReleaseByteArrayElements: Access jbyteArray data.
+  - NewStringUTF: Create a Java String from a C string.
+  - FindClass, GetMethodID, CallVoidMethod: Look up and invoke Java methods
+    from native code.
+  - ThrowNew: Throw a Java exception from native code.
+
+3.3.6 JNI Vulnerability Classes
+
+The JNI layer is a significant source of vulnerabilities:
+
+  Memory corruption: native functions manipulate raw pointers and buffer
+  allocations without managed-memory protection. Buffer overflows, use-
+  after-free, and heap corruption bugs are common.
+
+  Integer overflows: arithmetic on sizes passed from Java can overflow when
+  cast to smaller native types.
+
+  Null pointer dereferences: failure to check return values of JNI functions
+  (which can return NULL on failure) leads to crashes.
+
+  Exception handling errors: native code that calls JNI functions after a
+  pending exception is a protocol violation that corrupts runtime state.
+
+  Type confusion: incorrect cast between jstring and jbyteArray or similar
+  types causes type confusion in the native layer.
+
+
+3.4 Fuzz Testing
+================================================================================
+
+Fuzz testing, or fuzzing, is a technique in which a program is executed with
+automatically generated, often invalid or unexpected, inputs, and the
+resulting behaviour is monitored for anomalies such as crashes, hangs, or
+assertion failures. Fuzzing is one of the most productive vulnerability
+discovery techniques used in industry and academia.
+
+3.4.1 Random Fuzzing
+
+The simplest form of fuzzing generates inputs uniformly at random. While
+this can be effective for simple formats, it quickly saturates coverage
+because most random byte sequences do not satisfy the syntactic constraints
+of a complex input format.
+
+3.4.2 Coverage-Guided Fuzzing
+
+Coverage-guided fuzzing uses lightweight program instrumentation to track
+which branches or edges in the control-flow graph are exercised by a given
+input. Inputs that cover new edges are added to the seed corpus. The fuzzer
+then mutates these seeds to discover new paths.
+
+This feedback loop makes coverage-guided fuzzing substantially more effective
+than random testing. The following metrics are commonly used to measure
+coverage:
+
+  - Edge coverage: fraction of CFG edges exercised.
+  - Branch coverage: fraction of conditional branches that take both true
+    and false paths.
+  - Block coverage: fraction of basic blocks executed.
+
+3.4.3 Instrumentation Methods
+
+Coverage tracking can be achieved using compile-time or binary-level
+instrumentation.
+
+Compile-time: Source code is compiled with sanitizer or fuzzer
+instrumentation (e.g., `clang -fsanitize=fuzzer-no-link`). This is the
+approach used by LibFuzzer and AFL when source code is available.
+
+Binary-level: Tools such as QEMU-based AFL, DynamoRIO, and Intel PIN add
+instrumentation to a compiled binary without source code. This is slower
+but applicable to closed-source targets.
+
+3.4.4 AFL and AFL++
+
+AFL is a coverage-guided fuzzer that uses edge coverage to guide mutation.
+It tracks the frequency of edge transitions using a shared bitmap and treats
+any input that produces a new edge or a significantly different edge count
+as interesting. AFL uses a queue of interesting seeds and applies a
+sequence of deterministic and random mutations.
+
+AFL++ extends AFL with:
+  - Faster instrumentation via LTO (Link-Time Optimisation) and persistent
+    mode.
+  - Improved mutation scheduling (MOpt, havoc_block, etc.).
+  - Custom mutator support.
+  - Enhanced dictionary extraction and comparison solving.
+
+AFL++ is the fuzzer driver used in the harnesses generated by the framework
+presented in this thesis.
+
+3.4.5 The Harness
+
+A fuzzing harness is a small program that accepts fuzz input (typically via
+stdin or an input file) and invokes the target function. It serves as the
+bridge between the fuzzer and the target library. For AFL++, the harness
+typically reads data from a file specified on the command line and passes
+it to the target function.
+
+The quality of the harness determines the effectiveness of the fuzzing
+campaign. A harness that can reach deep code paths with minimal setup
+produces better results than one that rejects most inputs early.
+
+
+3.5 Static Analysis
+================================================================================
+
+Static analysis examines a program without executing it. It operates on
+source code, bytecode, or compiled binaries to infer properties such as
+data flow, control flow, and call structure.
+
+3.5.1 Call Graph Analysis
+
+A call graph represents calling relationships in a program. Each node is a
+function or method. A directed edge from A to B means that A may call B.
+Call graphs can be built at different levels of precision. Class Hierarchy
+Analysis (CHA) builds an over-approximate graph that includes all possible
+dispatch targets. Points-To Analysis (PTA) is more precise but more
+expensive.
+
+In this thesis, Soot builds the call graph of the Android application to
+find, for each native method, the Java methods that call it and what
+operations they perform before the call.
+
+3.5.2 Data-Flow Analysis
+
+Data-flow analysis propagates information about program variables through
+the control-flow graph. Taint analysis tracks the flow of sensitive values.
+Constant propagation tracks which variables hold constant values. Reaching
+definitions determine which assignments can reach a given use.
+
+In this thesis, FlowDroid's data-flow infrastructure is used to infer
+argument constraints: when a native method is called with an argument that
+holds a known constant string or integer range, this is recorded and used
+to generate more realistic seeds.
+
+3.5.3 DEX Bytecode Analysis
+
+DEX bytecode is a register-based bytecode format used by Android. Unlike
+Java class files (which are stack-based), DEX bytecode explicitly names
+virtual registers for each instruction. This makes it slightly easier to
+parse and analyse manually.
+
+In this thesis, jadx parses DEX bytecode and reconstructs Java-style class
+and method declarations. The output is used to identify native methods by
+their access flags and to collect method signatures.
+
+
+3.6 Seed Generation and Management
+================================================================================
+
+A seed is an input file used to start or continue a fuzzing campaign. Seed
+quality has a direct impact on fuzzing effectiveness.
+
+3.6.1 Structured Seeds
+
+For structured input formats, seeds must satisfy the format's syntactic
+constraints to pass initial parsing and reach deeper code. In the JNI
+harness setting, the harness parser reads a flat binary buffer and
+constructs JNI type values from it. The seed must therefore contain bytes
+that can be successfully parsed as each argument type.
+
+The seed generator in this framework produces structured seeds by writing
+valid placeholder values for each argument type: zero integers, empty
+strings, minimal byte arrays, and so on. These seeds can be parsed by the
+harness and passed to the target function.
+
+3.6.2 Seed Corpus Diversity
+
+A diverse corpus explores more code paths than a corpus of nearly identical
+seeds. Diversity can be achieved by using real-world inputs from the
+application domain, collecting inputs from multiple call sites, or
+performing cross-app seed sharing.
+
+3.6.3 Behavior Fingerprint
+
+A behavior fingerprint is a compact representation of the observable
+behavior of a program execution. In the context of this thesis, a behavior
+fingerprint is a composite string encoding: the termination signal, a
+bucketed execution duration, bucketed sizes of stdout and stderr, and the
+normalised first lines of the stderr output. Two executions with the same
+fingerprint are considered to have produced the same observable behavior.
+This concept is used for coverage-guided seed admission to avoid importing
+seeds that do not add new behaviors.
+
+
+3.7 Crash Triage and Deduplication
+================================================================================
+
+Fuzzing frequently produces large numbers of crashing inputs. Triage is the
+process of reducing this set to a small number of unique root causes.
+
+3.7.1 Signal-Based Grouping
+
+The first level of grouping uses the termination signal. SIGSEGV indicates
+an invalid memory access. SIGABRT indicates an abort (e.g., failed assertion,
+libc error). SIGFPE indicates a floating-point or integer arithmetic error.
+SIGILL indicates an illegal instruction.
+
+3.7.2 Stack Trace Extraction
+
+When source-level debug symbols or DWARF information is available, a
+debugger can extract a call stack from a core dump or a crash log. The top
+N frames of the stack, hashed together, provide a reliable crash signature.
+
+3.7.3 Text Normalisation for Stripped Binaries
+
+When symbols are stripped, stack traces are not available. In this case,
+the stderr log is used directly. Normalisation removes noisy values such as
+memory addresses, thread IDs, and variable numbers, then uses the normalised
+text as the crash signature. This approach works for crash logs generated by
+the Android runtime or libc, which typically include readable error messages
+alongside address-containing lines.
+
+3.7.4 Compression Ratio
+
+The compression ratio of a triage result is the total number of raw crashes
+divided by the number of unique clusters. A high compression ratio indicates
+that many crashes map to the same root cause, which is expected when a
+single systematic limitation (such as a missing library) is the dominant
+crash source.
+
+
+3.8 Scheduling and Resource Allocation
+================================================================================
+
+When multiple targets compete for a shared fuzzing budget, scheduling
+determines how the budget is distributed.
+
+3.8.1 Equal-Time Baseline
+
+The simplest scheduling policy runs targets in queue order, giving each
+target an equal slice of the total budget. This is easy to implement but
+ignores differences in harness productivity.
+
+3.8.2 Pilot-Then-Allocate
+
+A two-phase scheduling policy uses a short pilot phase to observe initial
+yields and then concentrates the remaining budget on the most productive
+targets. The pilot score can measure crash count, execution rate, or
+stability. The main phase then runs only the top-K harnesses by score.
+
+This strategy is similar to the Successive Rejects algorithm in the multi-
+armed bandit literature, but is simpler and more suitable for the case where
+a practitioner needs to make a single allocation decision rather than
+adaptively interleaving.
+
+3.8.3 Scoring Metrics
+
+For JNI harnesses, productive harnesses are those that:
+  - Execute without immediately crashing due to infrastructure issues.
+  - Reach the target function body rather than failing in the harness
+    setup code.
+  - Produce a measurable number of executions per second.
+
+The score function used in this thesis is a linear combination of crash
+count, executions per second, and a stability flag, as described in detail
+in the Methodology chapter.
+
+
+3.9 Key Terminology Summary
+================================================================================
+
+For reference, the following terms are used consistently throughout this
+thesis:
+
+  APK:             Android application package file.
+  DEX:             Dalvik Executable bytecode format.
+  JNI:             Java Native Interface.
+  JNIEnv:          The JNI environment pointer providing access to the JNI
+                   function table.
+  Native method:   A Java method declared with the `native` modifier,
+                   implemented in C or C++.
+  Harness:         A C++ program that reads fuzz input, parses it into
+                   JNI-typed arguments, and calls a target JNI function.
+  Seed:            An initial input file for a fuzzing campaign.
+  Seed corpus:     The collection of seed files maintained by the fuzzer.
+  Behavior fingerprint: A compact string encoding observable execution
+                   behavior used for seed filtering.
+  Fuzz.db:         The SQLite database maintaining the set of registered
+                   harnesses, serving as the fuzzing work queue.
+  Pilot run:       A short fixed-duration fuzzing run used to score a
+                   harness before the main fuzzing campaign.
+  Top-K:           The K highest-scoring harnesses selected for the main
+                   fuzzing budget.
+  Crash triage:    The process of normalising and clustering raw crashes
+                   into unique root causes.
+  Compression ratio: Total raw crashes / unique clusters.
+  Degraded mode:   Operation with --skip-preflight, bypassing the Android
+                   runtime dependency check when libart.so is unavailable.
+  Bionic:          The C library used by Android native code, incompatible
+                   with glibc on a standard Linux host.
+
+
+3.10 Summary
+================================================================================
+
+This chapter provided the foundational background for the thesis. The Android
+application model and APK structure were described. The JNI programming model,
+including native method declaration, type mappings, and common vulnerability
+classes, was explained in depth. The principles of coverage-guided fuzz
+testing and the role of the harness were reviewed. Static analysis techniques
+including call-graph construction, data-flow analysis, and DEX bytecode
+analysis were outlined. Finally, seed generation, behavior fingerprinting,
+crash triage, and scheduling concepts were defined. With this background,
+the reader is equipped to understand the system design described in Chapter 4.
+
+================================================================================
+END OF CHAPTER 3
+================================================================================

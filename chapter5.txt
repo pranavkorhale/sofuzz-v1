@@ -1,0 +1,455 @@
+================================================================================
+CHAPTER 5 — IMPLEMENTATION
+================================================================================
+
+
+5.1 Overview
+================================================================================
+
+This chapter describes the concrete implementation of the framework. It covers
+the execution environment (Docker container and host operating system), the
+directory structure of the project, the implementation of each component,
+key design decisions, and how the components are orchestrated. It also
+explains the configuration knobs that control the pipeline and documents
+the known implementation limitations.
+
+
+5.2 Execution Environment
+================================================================================
+
+5.2.1 Host Machine
+
+The framework is designed to run on an ARM64 Ubuntu 22.04 virtual machine.
+The host provides:
+  - Python 3.10 or later.
+  - Docker 24+.
+  - At least 16 GB RAM (for Soot analysis of large apps).
+  - At least 50 GB of free disk space (for APK files, native libraries,
+    harness directories, and fuzzing outputs).
+
+5.2.2 Docker Container
+
+The primary execution environment is a Docker container built from the
+project Dockerfile. The container provides:
+  - OpenJDK 11 (for jadx, Soot, FlowDroid).
+  - jadx 1.4+.
+  - Soot 4.4+ with the android.jar platform stub.
+  - FlowDroid 2.11+.
+  - Python 3 with sqlite3, json, subprocess, re, hashlib, argparse.
+  - clang/clang++ for harness compilation.
+  - AFL++ (afl-fuzz) for fuzzing.
+
+The project workspace is mounted into the container at `/mnt`:
+    docker run -v ~/sofuzz:/mnt <image> bash
+
+All pipeline scripts run with `/mnt` as the working directory.
+
+5.2.3 Environment Variables
+
+The following environment variables configure the pipeline:
+
+    APKS          Path to the app list file (default: apks.txt).
+    FUZZ_DATA     Root directory for app data (default: target_APK/).
+    CLEAN         If set to 1, clears existing analysis results before
+                  re-running.
+    HARNESS_GEN_FLAGS   Space-separated flags controlling which harness
+                        strategy variants are generated.
+
+Memory settings for the JVM:
+    export JAVA_TOOL_OPTIONS="-Xmx16g -Xss64m"
+
+
+5.3 Directory Structure
+================================================================================
+
+    sofuzz/
+    |-- apks.txt                   App package names to process.
+    |-- run-static-pipeline.sh     Master orchestration script.
+    |-- run_static_analysis_batch.py    Batch static analysis driver.
+    |-- generate_harnesses_batch.py     Batch harness generation driver.
+    |-- build_fuzz_queue.py             Work-queue population.
+    |-- run_ubuntu_experiment.sh        Experiment runner.
+    |
+    |-- static_analysis/
+    |   |-- preprocess.py          Orchestrates A1, A2, A3 for one app.
+    |   |-- jadx_extractor.py      Sub-stage A1: jadx wrapper.
+    |   |-- flowdroid_extractor.py Sub-stage A2: FlowDroid wrapper.
+    |   |-- soot_extractor.py      Sub-stage A3: Soot wrapper.
+    |   `-- merge.py               Merges sub-stage outputs.
+    |
+    |-- harness/
+    |   |-- harness_generator.py   Generates C++ harnesses.
+    |   |-- seed_generator.py      Generates initial seed files.
+    |   `-- cpp/
+    |       `-- harness_skeleton.cpp   Harness template.
+    |
+    |-- fuzzing/
+    |   |-- host_fuzz.py           Host-side fuzzer driver.
+    |   `-- fuzz.db                SQLite work queue.
+    |
+    |-- tools/
+    |   |-- build_seed_pool.py         N1a: Builds signature-to-seeds index.
+    |   |-- apply_seed_transfer.py     N1a: Copies compatible seeds.
+    |   |-- coverage_guided_transfer.py N1b: Fingerprint-filtered admission.
+    |   |-- eval_seed_transfer.py      3-way evaluation runner.
+    |   |-- adaptive_harness_scheduler.py  N2: Pilot-then-allocate scheduler.
+    |   |-- triage_host_crashes.py     N3: Text-based crash clustering.
+    |   `-- collect_results.py         Aggregates results for presentation.
+    |
+    |-- target_APK/
+    |   `-- <package>/
+    |       |-- base.apk
+    |       |-- static_analysis/
+    |       |-- harness_generation_callsequences.json
+    |       `-- fuzz/
+    |           `-- <harness_name>/
+    |               |-- harness.cpp
+    |               |-- harness_debug.cpp
+    |               |-- seeds/
+    |               `-- seed_constraints.json
+    |
+    `-- results/
+        |-- seed_pool.json
+        |-- eval_*.csv
+        |-- adaptive_budget_*.csv
+        |-- *_triage_*.csv
+        `-- _presentation/
+
+
+5.4 Static Analysis Implementation
+================================================================================
+
+5.4.1 `static_analysis/preprocess.py`
+
+This script is the entry point for processing a single app. It accepts the
+app package name as a command-line argument and sequentially invokes the
+three sub-stages. If any sub-stage fails, the failure is logged and the
+script continues with the information available.
+
+Key logic:
+    - Calls `jadx_extractor.py --apk target_APK/<app>/<app>.apk`
+    - Calls `flowdroid_extractor.py --apk ... --output ...`
+    - Calls `soot_extractor.py --apk ... --output ...`
+    - Calls `merge.py` to combine outputs.
+
+5.4.2 `run_static_analysis_batch.py`
+
+This script reads `apks.txt` and calls `preprocess.py` for each app.
+Lines beginning with `#` are treated as comments and skipped.
+
+5.4.3 FlowDroid Integration
+
+FlowDroid is invoked through its command-line interface. The output is
+parsed by the Python wrapper to extract argument-level annotations.
+
+5.4.4 Soot Integration
+
+Soot is invoked as a Java subprocess. The Soot main class is called with
+the Android platform jar and the target APK path. The output is a JSON
+file listing, for each native method, its callers and the pre-call Jimple
+statements.
+
+OOM Handling: If Soot exits with code 137 (OOM killed) or throws
+OutOfMemoryError, the script marks the call-sequence analysis as
+unavailable for that app and proceeds without it.
+
+
+5.5 Harness Generator Implementation
+================================================================================
+
+5.5.1 `harness/harness_generator.py`
+
+The generator reads `harness_generation_callsequences.json` and iterates
+over the function list. For each function, it determines which strategy
+variants to generate based on `HARNESS_GEN_FLAGS`.
+
+For each (function, strategy) pair, it:
+  1. Reads `harness_skeleton.cpp`.
+  2. Determines the argument list and types.
+  3. Generates `GENERATOR_ARGS_SETUP` code by iterating the argument list
+     and emitting the appropriate parser block for each type.
+  4. Generates `GENERATOR_FUNC_CALL` by building the argument name list.
+  5. Generates `GENERATOR_CLEANUP` for JNI object releases.
+  6. Substitutes all placeholders into the skeleton.
+  7. Writes the completed harness to the output directory.
+  8. Also writes `harness_debug.cpp` with added print statements.
+  9. Calls `seed_generator.py` to write initial seeds.
+
+5.5.2 Call-Sequence Variant Logic
+
+For `@cs@N` and `@arg-cs@N` variants, the generator wraps the argument
+setup with a JNI environment initialisation block. A mock JNIEnv is created
+on the stack, and the pre-call operations are emitted as C++ statements.
+Java string constants appear as `env->NewStringUTF("...")`. Java object
+constructions appear as `env->AllocObject(...)` (or equivalent stub calls).
+
+5.5.3 `harness/seed_generator.py`
+
+The seed generator reads `seed_constraints.json` for the harness and writes
+three seed variants to `seeds/`:
+  - seed_zero.bin: All fields set to zero or empty.
+  - seed_default.bin: Fields set to default values ("test" for strings,
+    4-byte value 1 for integers, 8-byte zero array for byte arrays).
+  - seed_const.bin: Fields set to any known constant values extracted
+    from argument constraint analysis.
+
+If no constraint information is available, only seed_zero and seed_default
+are written.
+
+
+5.6 Work Queue Implementation
+================================================================================
+
+5.6.1 `build_fuzz_queue.py`
+
+This script scans `target_APK/*/fuzz/*/harness.cpp` to discover all
+generated harnesses. For each discovered harness it extracts the app name
+and harness name and inserts the pair into `fuzzing/fuzz.db` using:
+
+    INSERT OR IGNORE INTO fuzzdata (app, fname) VALUES (?, ?)
+
+The `INSERT OR IGNORE` ensures idempotency: re-running the script on a
+partially populated database does not create duplicates.
+
+5.6.2 Database Queries
+
+Common queries used by downstream tools:
+
+    # List all harnesses for an app:
+    SELECT fname FROM fuzzdata WHERE app = ?
+
+    # List all apps with harnesses:
+    SELECT DISTINCT app FROM fuzzdata
+
+    # Count harnesses per app:
+    SELECT app, COUNT(*) FROM fuzzdata GROUP BY app
+
+
+5.7 Host Fuzzer Implementation
+================================================================================
+
+5.7.1 `fuzzing/host_fuzz.py`
+
+This script compiles and runs a single harness using AFL++. Its steps are:
+
+  1. Resolve the harness directory path.
+  2. Run a preflight check to verify that the required native library
+     (libart.so) is accessible on the host (unless --skip-preflight is set).
+  3. Compile the harness with:
+       clang++ -O1 -fsanitize=address,undefined
+               -I<harness_dir> -o <harness_bin>
+               <harness_dir>/harness.cpp
+  4. Run AFL++ with the compiled binary:
+       afl-fuzz -i <seeds_dir> -o <out_dir> -- ./<harness_bin> @@
+  5. Parse the AFL++ output directory to collect crash count and
+     execution statistics.
+  6. Return a JSON result object.
+
+5.7.2 Preflight Check
+
+The preflight check calls `dlopen("libart.so")` via a small helper binary
+and reports an error if it fails. This check is skipped in degraded mode
+(`--skip-preflight`), allowing the harness to be compiled and run even if
+the Android Runtime is not present. Runs will typically crash with SIGABRT
+in degraded mode.
+
+5.7.3 Compile-Time Flags
+
+Harnesses are compiled with:
+  - `-O1`: Optimisation level for reasonable execution speed without
+    eliminating all sanitizer checks.
+  - `-fsanitize=address,undefined`: AddressSanitizer and
+    UndefinedBehaviorSanitizer to detect memory errors and UB.
+  - `-I<harness_dir>`: Include path for local headers.
+
+5.7.4 `run_host_fuzz.sh`
+
+A shell wrapper that exports required environment variables and calls
+`fuzzing/host_fuzz.py`. It accepts the app name, harness name, seed source
+flag, and optional `--skip-preflight` argument.
+
+
+5.8 N1a and N1b Implementation
+================================================================================
+
+5.8.1 `tools/build_seed_pool.py`
+
+Iterates over all harnesses in `fuzz.db`. For each harness, reads
+`seed_constraints.json` to extract the JNI type signature string. Builds
+a dictionary:
+
+    signature_string -> [
+        { "app": ..., "harness": ..., "seeds": [...seed_paths...] },
+        ...
+    ]
+
+Serialises the dictionary to `results/seed_pool.json`.
+
+5.8.2 `tools/apply_seed_transfer.py`
+
+Reads `seed_pool.json`. For each harness H, finds all other harnesses
+with the same signature. Copies seed files from those harnesses to
+`target_APK/<app>/fuzz/<harness>/seeds_transferred/`. Prints a transfer
+summary showing how many seeds were copied per harness.
+
+5.8.3 `tools/coverage_guided_transfer.py`
+
+Main algorithm:
+  1. For each harness H in the queue:
+     a. Run each local seed through the harness and record its fingerprint.
+     b. Initialise the observed set with local fingerprints.
+  2. For each harness H in the queue:
+     a. For each candidate seed from compatible harnesses (sorted by app
+        to ensure determinism):
+        - Execute the harness with the candidate seed.
+        - Compute the fingerprint.
+        - If fingerprint not in observed, admit and add fingerprint to
+          observed.
+  3. Write admitted seeds to `seeds_transferred_cg/`.
+  4. Write a per-harness admission log to `results/cg_admission_log.json`.
+
+The execution in step (b) is performed with a short timeout (5 s default)
+to avoid blocking on harnesses that hang during input processing.
+
+
+5.9 N2 Implementation
+================================================================================
+
+5.9.1 `tools/adaptive_harness_scheduler.py`
+
+Implementation steps:
+
+  Phase 1: Pilot
+    - Query `fuzz.db` for all registered harnesses.
+    - For each harness, call `run_host_fuzz` with `--time <pilot_secs>`.
+    - Record: crash count, executions, parser stability.
+    - Compute score using the scoring function defined in Section 4.8.2.
+
+  Phase 2: Top-K Selection and Main Fuzz
+    - Sort harnesses by score descending.
+    - Select top K (default K=5 or min(5, total)).
+    - Compute remaining time per harness: remaining / K.
+    - For each top-K harness, call `run_host_fuzz` with the allocated time.
+
+  Post-Processing:
+    - Automatically invokes `triage_host_crashes.py` on the crash output
+      from all top-K harnesses.
+    - Writes a scheduling report CSV to `results/adaptive_budget_<timestamps>.csv`.
+
+5.9.2 `run_host_fuzz` helper function
+
+Inside `adaptive_harness_scheduler.py`, a helper function wraps
+`fuzzing/host_fuzz.py` as a subprocess call. The helper:
+  - Constructs the argument list including `--app`, `--harness`, `--time`,
+    `--seed-source`, and optionally `--skip-preflight`.
+  - Captures stdout/stderr.
+  - Parses the JSON result written by `host_fuzz.py`.
+  - Returns a result dictionary.
+
+
+5.10 N3 Implementation
+================================================================================
+
+5.10.1 `tools/triage_host_crashes.py`
+
+Input:
+  - A list of crash directories, one per harness. Each crash directory
+    contains AFL++ crash files (each named `id:000000,sig:06,...`).
+  - For each crash file, a corresponding stderr log at `<crash_file>.stderr`.
+
+Processing:
+  1. Walk all crash directories.
+  2. For each crash file, read the `.stderr` log.
+  3. Apply normalisation (address masking, number masking, thread ID masking).
+  4. Compute the signature from the termination signal and first 5 normalised
+     lines.
+  5. Assign to an existing cluster or create a new cluster.
+
+Output:
+  A CSV file `results/*_triage_<timestamp>.csv` with columns:
+    cluster, count, apps, harnesses, signature
+
+5.10.2 Normalisation Regex Patterns
+
+The following patterns are applied in sequence:
+
+    r'0x[0-9a-fA-F]+'      -> '<ADDR>'
+    r'\b[0-9]{4,}\b'       -> '<NUM>'
+    r'Thread\s+\d+'         -> 'Thread <TID>'
+    r'tid=\d+'              -> 'tid=<TID>'
+    r'pid=\d+'              -> 'pid=<PID>'
+
+
+5.11 Result Collection
+================================================================================
+
+5.11.1 `tools/collect_results.py`
+
+After all experiments are complete, this script aggregates outputs into
+`results/_presentation/`:
+  - Copies all eval CSVs and triage CSVs.
+  - Generates a summary JSON with experiment metadata and high-level metrics.
+  - Prints a summary table to stdout.
+
+This directory is the recommended location to inspect experimental results.
+
+
+5.12 Configuration Knobs Summary
+================================================================================
+
+The following table summarises the key configuration parameters:
+
+    Parameter              Default    Description
+    ---------------------- --------- ------------------------------------------
+    pilot_secs             60        Duration of each pilot run (seconds).
+    total_budget_secs      600       Total fuzzing budget per harness (seconds).
+    top_k                  5         Number of harnesses in main phase.
+    w_c (crash weight)     10        Weight for crash count in score function.
+    w_e (exec weight)      1         Weight for execution rate in score function.
+    w_s (stability weight) 5         Weight for stability flag in score function.
+    cg_timeout_secs        5         Timeout for coverage-guided seed probing.
+    seed_transfer_method   both      "naive", "cg", or "both".
+    --skip-preflight       False     Bypass Android Runtime dependency check.
+
+
+5.13 Known Limitations of the Implementation
+================================================================================
+
+  1. Bionic-Glibc Incompatibility (Section 4.10): The framework cannot
+     execute real Android JNI code on a glibc-based host. All harnesses
+     run in degraded mode.
+
+  2. Mock JNIEnv: The mock JNIEnv does not implement the full JNI function
+     table. Native functions that use unimplemented JNI functions will
+     either crash or produce incorrect results.
+
+  3. Sequential Processing: The current implementation processes harnesses
+     sequentially. The `fuzz.db` architecture supports multi-worker
+     parallelism but it is not yet implemented.
+
+  4. Soot OOM: Large applications (>500 classes) may cause Soot to run out
+     of heap memory. Call-sequence harnesses are not generated for these apps.
+
+  5. Dynamic Registration: `RegisterNatives` is not fully resolved. Native
+     functions registered dynamically may not be discovered by the jadx
+     extractor unless the naming convention path is also used.
+
+  6. Corpus Management: Seeds are not deduplicated after transfer. A future
+     implementation should run `afl-cmin` to remove redundant seeds.
+
+
+5.14 Summary
+================================================================================
+
+This chapter described the implementation of the proposed JNI fuzzing
+framework. The Docker-based execution environment, directory structure, and
+all key scripts were documented. For each component — static analysis,
+harness generation, fuzzing, seed transfer, adaptive scheduling, and crash
+triage — the implementation approach, key design decisions, and limitations
+were explained. The configuration knobs that control the pipeline were
+listed. The next chapter presents the experimental setup and results obtained
+by running the framework on a selected set of Android applications.
+
+================================================================================
+END OF CHAPTER 5
+================================================================================

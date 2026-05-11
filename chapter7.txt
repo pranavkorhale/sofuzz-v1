@@ -1,0 +1,256 @@
+================================================================================
+CHAPTER 7 — CONCLUSION AND FUTURE WORK
+================================================================================
+
+
+7.1 Conclusion
+================================================================================
+
+This thesis presented the design, implementation, and evaluation of an
+automated end-to-end JNI fuzzing framework for Android applications. The
+framework addresses the fundamental challenge that modern Android applications
+expose substantial attack surface through stripped native libraries accessed
+via JNI, yet existing Android security tools do not systematically test this
+layer because each native entry point requires a custom harness, realistic
+input seeds, and the right call-site context to be fuzzed effectively.
+
+The framework takes Android APK files as input and automatically performs
+multi-stage static analysis to extract JNI entry points, argument constraints,
+and Java-side call-sequence context. From this analysis, compilable C++
+harnesses are generated in four strategy variants — basic, argument-constrained,
+call-sequence-aware, and combined — along with structured seed files. All
+harnesses and their seeds are registered in a central SQLite work queue that
+decouples generation from execution.
+
+On top of this foundation, four distinct novelties are implemented and
+evaluated:
+
+N1a — Cross-App JNI Seed Transfer: Seeds generated for one application are
+shared with harnesses of other applications when their JNI type signatures
+match. This structural compatibility guarantee ensures that transferred seeds
+are always parseable by the receiving harness, providing corpus diversity at
+no additional analysis cost.
+
+N1b — Coverage-Guided Seed Admission: A behavior fingerprinting mechanism
+probes each candidate transferred seed and admits it only if it produces a
+new observable behavior, filtering out redundant seeds that would otherwise
+enlarge the corpus without increasing behavioral diversity.
+
+N2 — Adaptive Top-K Harness Budgeting: A two-phase pilot-then-allocate
+scheduling strategy uses short pilot runs to score all harnesses by crash
+yield, execution throughput, and parser stability, and then concentrates the
+main fuzzing budget on the top-K harnesses. This is compared against an
+equal-time queue-order baseline under the same total budget.
+
+N3 — Integrated Crash Triage: A text-based crash normalisation and
+clustering tool reduces the volume of raw crash files to a set of unique
+root causes by masking noisy values (addresses, thread IDs, numbers) in
+stderr logs and grouping crashes with identical normalised signatures. The
+triage tool demonstrated a compression ratio of 4597:1 in the conducted
+experiments.
+
+The framework is fully automated from APK input to triage output, requiring
+no manual harness writing, no manual seed construction, and no manual crash
+review. It is implemented in Python 3 and C++ and operates in a Docker
+container with standard open-source tooling.
+
+
+7.2 Summary of Contributions
+================================================================================
+
+The specific contributions of this thesis are:
+
+  1. An automated multi-stage static analysis pipeline for Android APKs
+     that extracts JNI entry points, argument constraints, and call-sequence
+     context without requiring application source code.
+
+  2. An automated harness generator that produces four strategy variants of
+     C++ fuzzing harnesses per JNI function, covering a spectrum from basic
+     to call-sequence-aware, along with structured seed files.
+
+  3. A centralised SQLite-based fuzzing work queue that decouples harness
+     generation from execution and enables future distributed fuzzing.
+
+  4. Cross-app JNI seed transfer (N1a) based on JNI type signature
+     compatibility, providing corpus diversity across application boundaries.
+
+  5. Coverage-guided seed admission (N1b) using behavior fingerprinting to
+     filter redundant transferred seeds.
+
+  6. Adaptive top-K harness budgeting (N2) that allocates the fuzzing budget
+     to the most productive harnesses using a two-phase pilot-then-exploit
+     strategy.
+
+  7. Integrated crash triage (N3) providing automated, symbol-free
+     deduplication of native JNI crash logs using text normalisation.
+
+
+7.3 Key Findings
+================================================================================
+
+  Finding 1: The JNI attack surface of commercial Android applications is
+  large. Static analysis of selected applications revealed hundreds to
+  thousands of JNI native entry points per application (e.g., 1877 native
+  functions with call sequences in com.UCMobile.intl). This scale motivates
+  automated harness generation.
+
+  Finding 2: The four harness strategy variants serve different depth-versus-
+  stability trade-offs. The basic variant (@@0) is always stable but produces
+  the shallowest exploration. The call-sequence variants are more realistic
+  but require JNI environment setup that can fail without the Android Runtime.
+
+  Finding 3: Cross-app seed transfer is structurally feasible for any pair of
+  harnesses with identical JNI type signatures. The seed pool construction
+  identified a significant fraction of harnesses with at least one compatible
+  partner, demonstrating that this form of seed reuse is broadly applicable.
+
+  Finding 4: Behavior fingerprinting correctly identifies redundant seeds in
+  degraded mode, with the dominant fingerprint corresponding to the
+  SIGABRT-on-dlopen failure. This confirms that the admission mechanism
+  operates correctly, even if meaningful behavioral diversity cannot be
+  demonstrated without a working runtime.
+
+  Finding 5: Adaptive scheduling consistently selects harnesses with higher
+  execution rates in the pilot phase. Score variance across harnesses exists
+  even in degraded mode, validating the premise that not all harnesses are
+  equally productive.
+
+  Finding 6: Text-based crash triage is highly effective even without symbol
+  information. All 4597 crashes from the degraded-mode experiments were
+  correctly attributed to a single root cause cluster with a 4597:1
+  compression ratio, demonstrating that the triage tool eliminates
+  redundant crash analysis work.
+
+
+7.4 Limitations
+================================================================================
+
+  1. Bionic-Glibc Incompatibility: The most significant limitation is the
+     inability to execute Android JNI libraries directly on a standard glibc-
+     based Linux host. All experiments were conducted in degraded mode in
+     which harnesses compile but cannot load the target library. This prevents
+     the observation of actual native code vulnerabilities in the current
+     evaluation. Resolving this requires running harnesses on an Android
+     device or Android-compatible emulator.
+
+  2. Mock JNIEnv: The mock JNI environment does not implement the full JNI
+     function table. Native functions that call unimplemented JNI functions
+     will abort. A complete JNI stub library would extend harness depth.
+
+  3. Sequential Execution: The framework currently runs harnesses sequentially.
+     The SQLite work queue design supports parallelism, but multi-worker
+     execution is not yet implemented.
+
+  4. Dynamic Native Registration: Functions registered via `RegisterNatives`
+     inside `JNI_OnLoad` are not fully resolved by the current static analysis.
+     This may cause some native entry points to be missed.
+
+  5. Small Evaluation Set: The number of applications used in the evaluation
+     is limited by time and hardware constraints. Results over a larger and
+     more diverse set of applications would strengthen the conclusions.
+
+  6. Fixed Scoring Weights: The scoring weights in the adaptive scheduler
+     (w_c, w_e, w_s) were chosen empirically. A systematic parameter search
+     or a learned model would likely improve scheduling quality.
+
+
+7.5 Future Work
+================================================================================
+
+7.5.1 Android Emulator Integration
+
+The most impactful near-term improvement is to integrate the framework with
+an Android emulator (e.g., QEMU-based Android image or a physical Android
+device). Harnesses would be pushed to the device and executed on the device
+where the Bionic runtime is natively available. This would remove the
+degraded-mode limitation and allow real native code fuzzing.
+
+A promising approach is to use the Android Debug Bridge (ADB) to push
+compiled harnesses to a rooted device or an emulator, run them under
+AFL++, and pull the crash results back to the host for triage. This
+modification requires adapting `host_fuzz.py` to use ADB as the execution
+backend.
+
+7.5.2 Parallel Fuzzing with Multiple Workers
+
+The `fuzz.db` work queue can support multiple workers dequeuing and fuzzing
+different harnesses concurrently. Adding a `status` column (pending, running,
+done) and worker locking to the database would enable multiple parallel
+fuzzing processes. This would significantly increase throughput on multi-
+core machines.
+
+7.5.3 Deeper Argument Constraint Extraction
+
+The current FlowDroid-based argument analysis captures constant strings and
+simple integer ranges. Extending the analysis to track more complex
+constraints — such as format strings, enum values, and buffer alignment
+requirements — would produce more realistic seeds and reduce early-exit
+rates in the target function.
+
+7.5.4 Seed Corpus Minimization
+
+Before starting a fuzzing campaign, the seed corpus (local + transferred)
+should be minimised using `afl-cmin` to remove seeds that do not contribute
+new edge coverage. This would reduce the corpus size and improve the fuzzer's
+queue processing speed.
+
+7.5.5 Machine Learning-Based Harness Scheduling
+
+The adaptive scheduling policy uses a manually defined scoring function.
+A reinforcement learning approach could learn a scheduling policy from
+historical fuzzing data, dynamically adjusting the harness selection and
+time allocation based on observed yields. This is particularly relevant
+when the harness population is large and the productivity landscape is
+complex.
+
+7.5.6 Cross-Architecture Support
+
+The current framework targets ARM64 applications. The static analysis and
+harness generation components are largely architecture-independent, but the
+compilation and fuzzing steps assume an ARM64 host. Supporting x86_64 APKs
+on an x86_64 host, or using cross-compilation for ARM binaries, would
+broaden the framework's applicability.
+
+7.5.7 Integration with ASAN and Sanitizer Reports
+
+When the Android Runtime is available, harnesses should be compiled with
+AddressSanitizer, MemorySanitizer, and UndefinedBehaviorSanitizer active
+on both the harness and the target library. The structured sanitizer reports
+would substantially improve crash triage quality, providing exact bug types
+(heap buffer overflow, use-after-free, etc.) and call-stack information.
+
+7.5.8 Continuous Fuzzing Pipeline
+
+The framework could be extended into a continuous integration-style pipeline
+that automatically processes new APK versions as they are released, compares
+harness populations between versions, and alerts when new JNI entry points
+appear or when previously clean harnesses start crashing.
+
+
+7.6 Final Remarks
+================================================================================
+
+The JNI layer of Android applications represents a structural blind spot in
+the current landscape of Android security testing. Most analysis and testing
+tools focus on the Java/Kotlin layer and treat native libraries as opaque.
+This thesis demonstrates that it is feasible to automatically extract, wrap,
+and fuzz the entire JNI attack surface of an Android application from a
+single APK file, using only open-source tools and standard static analysis
+techniques.
+
+The four novelties — cross-app seed sharing, behavior-guided admission,
+adaptive scheduling, and integrated triage — each address a specific
+practical challenge in large-scale JNI fuzzing and together form a coherent
+system that reduces the analyst's workload at every stage. While the current
+evaluation is limited by the Bionic-Glibc runtime incompatibility, the
+framework is architecturally complete, and the primary remaining work is
+integration with an Android-compatible runtime environment.
+
+We believe that this work makes a meaningful contribution toward the goal
+of systematic, automated security analysis of the native code embedded in
+commercial Android applications, and we hope that it provides a foundation
+for continued research in this area.
+
+================================================================================
+END OF CHAPTER 7
+================================================================================

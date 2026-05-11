@@ -1,0 +1,356 @@
+================================================================================
+CHAPTER 2 — LITERATURE SURVEY
+================================================================================
+
+
+2.1 Introduction
+================================================================================
+
+This chapter surveys existing research relevant to the automated fuzzing of
+Android native libraries through JNI. The work presented in this thesis
+draws from several related fields, including Android application security,
+static program analysis, fuzz testing, harness generation, seed management,
+budget scheduling, and crash triage. Each section reviews the major
+contributions in one of these areas, explains the state of the art, and
+identifies the limitations that motivate the novelties introduced in this
+thesis.
+
+
+2.2 Android Application Security
+================================================================================
+
+Android security has received significant research attention over the past
+decade. Early research focused on permission analysis, examining whether
+applications request excessive or unnecessary permissions that could be
+misused. Studies such as Felt et al. showed that many Android applications
+requested more permissions than needed and that users rarely understood the
+implications. This motivated the development of automated permission auditing
+tools.
+
+A major line of work has focused on information-flow analysis for detecting
+privacy leaks. FlowDroid, developed by Arzt et al. and presented at PLDI
+2014, introduced a context-, flow-, field-, and object-sensitive static taint
+analysis tool for Android applications. FlowDroid accurately models the
+Android lifecycle, including activity creation, callbacks, and fragment
+interactions, and can trace sensitive data from sources (e.g. GPS location,
+contact list) to sinks (e.g. network send, file write). The tool demonstrated
+high recall and precision on the DroidBench benchmark and has become a
+standard reference for Android taint analysis.
+
+Research in Android malware detection has also been productive. Drebin by
+Arp et al. proposed a machine-learning approach that analyses static APK
+features such as API calls, permissions, and intents to identify malware.
+MaMaDroid extended this idea using call-graph sequences. These approaches
+analyse application-level behaviour but operate primarily on the Java/DEX
+layer.
+
+2.2.1 Limitations of Java-Layer Analysis
+
+A common limitation of the above approaches is that they analyse the managed
+Java layer and do not deeply inspect native libraries. When a security issue
+exists in native code, Java-layer analysis typically cannot detect it. The
+JNI boundary is difficult to cross in static analysis. A function call from
+Java into native code loses type information, argument semantics, and
+control-flow properties as soon as the native boundary is crossed.
+
+Furthermore, most existing Android security tools treat native libraries as
+opaque blobs unless separate native binary analysis is performed. This means
+the native layer is a structural blind spot in most existing toolchains.
+
+
+2.3 Native Code Analysis and JNI Security
+================================================================================
+
+Some research has specifically targeted Android native code and JNI. Static
+analysis of JNI entry points requires identifying which Java `native`
+declarations map to which C/C++ implementations. In stripped libraries, this
+mapping is either inferred from JNI naming conventions or recovered by
+tracing `RegisterNatives` calls inside `JNI_OnLoad`.
+
+Work by Wei et al. on JN-Saf and related tools attempted to extend taint
+analysis across the JNI boundary by modelling how Java objects are passed to
+native code. JuCify by Borzacchiello et al. combined the Java call graph and
+the native call graph to build a unified model for whole-application analysis.
+
+Other research has focused on identifying JNI misuse patterns. Studies have
+shown that developers frequently make errors such as forgetting to clear
+pending exceptions, creating too many local references without freeing them,
+passing the wrong argument types, and misusing JNI string functions. These
+errors can lead to crashes, memory leaks, or undefined behaviour.
+
+2.3.1 Gap in JNI-Level Fuzzing
+
+While the above studies improved the understanding of JNI security, they
+do not address the problem of automated harness generation and fuzzing at
+the JNI level. Most of them focus on static analysis and do not perform
+dynamic testing of native entry points at scale. A system that can
+automatically generate harnesses for hundreds of JNI functions across
+multiple APKs and drive fuzzing experiments is not addressed by the
+existing literature.
+
+
+2.4 Fuzz Testing
+================================================================================
+
+Fuzz testing is one of the most practically effective techniques for finding
+security vulnerabilities in software. The basic principle is to generate a
+large number of inputs automatically and feed them to a program, monitoring
+for crashes, hangs, assertion failures, or sanitizer-detected errors.
+
+2.4.1 Mutation-Based Fuzzing
+
+Mutation-based fuzzers start from a corpus of valid seed inputs and produce
+new inputs by applying random mutations such as bit flips, byte insertions,
+deletions, and replacements. AFL (American Fuzzy Lop), developed by Michal
+Zalewski, popularised coverage-guided mutation fuzzing. AFL uses lightweight
+instrumentation to track edge coverage and prefers inputs that discover new
+execution paths. It has been used to find thousands of real-world
+vulnerabilities in programs such as file parsers, network daemons, and
+media libraries.
+
+AFL++ by Fioraldi et al., presented at WOOT 2020, extended AFL with multiple
+instrumentation modes, mutation strategies, and scheduling improvements. It
+integrates techniques such as MOpt for adaptive mutation operator selection,
+Redqueen for solving magic-byte comparisons, LAF-Intel for splitting
+comparisons, and custom mutator support. AFL++ has become the de facto
+standard baseline for mutation-based fuzzing research.
+
+libFuzzer is another widely used coverage-guided fuzzer developed by the
+LLVM project. It is designed for in-process fuzzing with direct
+instrumentation and is well-suited for library testing when a simple
+entry-point function can be written.
+
+2.4.2 Structure-Aware and Grammar-Based Fuzzing
+
+Standard mutation fuzzers may produce many invalid inputs for structured
+formats such as XML, JSON, protocol buffers, or multimedia files. Structure-
+aware fuzzers use a grammar or format model to generate inputs that remain
+syntactically valid. Peach is an example of a grammar-based fuzzer.
+AFLSmart by Pham et al. combines AFL's coverage guidance with Peach's
+structure-aware mutation.
+
+In the context of JNI fuzzing, the input structure is defined by the JNI
+argument types and the harness parser. Seeds must satisfy the parser's byte
+layout to reach the target function. This thesis uses structured seed
+generation and argument-aware harness construction to address this challenge,
+drawing on ideas from structure-aware fuzzing.
+
+2.4.3 Fuzzing Android Applications
+
+Direct fuzzing of Android applications has been explored in limited ways.
+Monkey is an Android tool that generates random UI events to test
+applications through their interfaces. IntentFuzzer and DPIFuzz focus on
+fuzzing Android intents and inter-component communication. These approaches
+test the Android application layer, not the native code layer.
+
+More direct native fuzzing in the Android context is difficult because of
+the runtime dependency on Android libraries and the JNI execution model.
+This thesis addresses this gap by generating host-side JNI harnesses that
+can run on a standard Linux host after extracting the necessary static
+information from the APK.
+
+
+2.5 Static Analysis Tools Used in This Thesis
+================================================================================
+
+The framework in this thesis relies on three static analysis technologies
+for extracting information from APK files.
+
+2.5.1 DEX Decompilation with jadx
+
+jadx is an open-source tool for decompiling Android APK and DEX files to
+Java source code. It parses the DEX bytecode and reconstructs class
+structures, method declarations, field types, and access flags. In this
+thesis, jadx is used to extract native method declarations from Java
+classes. A method declared with the `native` modifier corresponds to a JNI
+entry point. jadx output is parsed to collect the method name, declaring
+class, return type, and parameter types for each native method.
+
+2.5.2 Inter-Procedural Data-Flow Analysis with FlowDroid
+
+FlowDroid provides an inter-procedural data-flow analysis framework for
+Android applications. While its primary design is for taint tracking, its
+data-flow infrastructure can be reused to trace what values are passed to
+native methods at call sites. In this thesis, FlowDroid is used to infer
+argument constraints for JNI functions, such as constant strings, integer
+ranges, and buffer length relationships. These constraints guide seed
+generation and produce more realistic harness variants.
+
+2.5.3 Call-Graph Analysis with Soot
+
+Soot, developed by the Sable Research Group at McGill University and
+published at CASCON 1999, is a framework for Java bytecode analysis and
+transformation. It provides multiple intermediate representations including
+Jimple and supports call-graph construction using Class Hierarchy Analysis
+(CHA) and other algorithms.
+
+In this thesis, Soot is used to build a call graph of the Android
+application and extract, for each native method, the Java-side operations
+that occur immediately before each call site. This call-sequence information
+is used to generate call-sequence-aware harnesses that reproduce a
+realistic setup before invoking the native function.
+
+
+2.6 Seed Management in Fuzzing
+================================================================================
+
+Seed quality and seed selection have a significant effect on fuzzing
+effectiveness. A fuzzer that starts from high-quality seeds reaches
+interesting code paths more quickly than one that starts from random bytes.
+
+2.6.1 Seed Corpus Construction
+
+LibFuzzer recommends using real inputs from the target domain as seeds.
+OSS-Fuzz maintains large seed corpora for continuously fuzzed open-source
+projects. AFL includes a cmin utility to minimize seed corpora by removing
+redundant seeds that do not add edge coverage.
+
+2.6.2 Seed Scheduling
+
+Within a single fuzzing campaign, seed scheduling determines which seeds
+are selected for mutation. AFLFast by Bohme et al. prefers seeds that
+exercise less-visited program paths. MOpt by Lyu et al. adapts mutation
+operators based on historical performance. EcoFuzz improves energy
+allocation using an adversarial multi-armed bandit model.
+
+2.6.3 Cross-Target Seed Reuse
+
+Some work has explored reusing seeds across multiple targets. Ensemble
+Fuzzing aggregates results from multiple fuzzers to diversify coverage.
+CollAFL uses path-sensitive seed selection. However, cross-application seed
+transfer specifically for JNI harnesses based on signature-level
+compatibility has not been addressed in the existing literature.
+
+This thesis introduces cross-app seed transfer at the JNI argument-shape
+level, where seeds are shared between harnesses of different applications
+when their JNI signatures match. This is a structural property of the JNI
+ABI that guarantees parser compatibility without requiring semantic
+similarity.
+
+
+2.7 Fuzzing Budget Allocation
+================================================================================
+
+Budget allocation in fuzzing determines how the available computational
+resources are distributed across targets. Most existing work addresses
+allocation within a single campaign at the input-queue level.
+
+2.7.1 Input-Level Scheduling
+
+AFLGo by Bohme et al. performs directed fuzzing by computing the distance
+of seeds from target locations and assigning more energy to closer seeds.
+FairFuzz by Lemieux and Sen focuses on branches that are rarely covered.
+PerfFuzz by Lemieux et al. targets inputs that maximise the execution counts
+of specific program locations.
+
+These techniques all operate within a single fuzzing campaign and decide
+which inputs to prioritize. They do not address the question of which target
+programs or harnesses should receive the fuzzing budget when many targets
+are available.
+
+2.7.2 Multi-Target Scheduling
+
+When multiple targets must be fuzzed and the total time budget is limited,
+the question of how to allocate time across targets is important. This
+problem has similarities to the multi-armed bandit problem in reinforcement
+learning, where each arm corresponds to a target and the reward corresponds
+to fuzzing yield.
+
+This thesis introduces a simpler but practical approach: a two-phase pilot-
+then-allocate strategy that scores harnesses using a short pilot run and
+then allocates the main budget to the top-K harnesses. This differs from
+existing work in that it operates at the harness level above the fuzzer,
+targets the JNI-specific harness population, and uses a strictly equal-
+budget contest to evaluate the selection policy.
+
+
+2.8 Crash Triage and Deduplication
+================================================================================
+
+Fuzzing can produce a large number of crash files. Effective crash triage
+reduces this volume to a small set of unique root causes.
+
+2.8.1 Stack-Based Deduplication
+
+Tools such as BugRedux and StackHash use call-stack hashes to identify
+duplicate crashes. AFL uses its own crash directory structure and a simple
+uniqueness test based on the seed that caused the crash. GDB and LLDB can
+be used to extract stack traces from core dumps.
+
+2.8.2 Sanitizer-Assisted Triage
+
+AddressSanitizer (ASAN), MemorySanitizer (MSAN), and UndefinedBehaviorSanitizer
+(UBSAN) produce structured error reports that include crash type, location,
+and memory access details. These reports are easier to cluster than raw
+stderr logs.
+
+2.8.3 Lightweight Text-Based Triage
+
+In settings where instrumentation is not available, crash logs contain only
+the signal, stderr output, and possibly library-level error messages. Igor
+by Pham et al. and AURORA by Blazytko et al. use more sophisticated
+techniques to cluster crashes, but they require additional binary analysis.
+
+In this thesis, a lightweight text-based triage approach is used. Noisy
+values in stderr logs are normalised and the first few lines of each
+normalised log are used as a crash signature. This approach does not require
+symbol information, stack traces, or binary instrumentation, making it
+suitable for stripped Android native libraries.
+
+
+2.9 Research Gap
+================================================================================
+
+From the reviewed literature, the following gaps can be identified that
+motivate the contributions of this thesis.
+
+Gap 1: Most Android security analysis operates on the Java/DEX layer and
+does not systematically test JNI native functions.
+
+Gap 2: JNI functions require specialised harnesses for fuzzing, but no
+automated system exists to generate these harnesses from APK static analysis
+at scale.
+
+Gap 3: Seed management for JNI fuzzing must account for structured argument
+types. Cross-app seed reuse at the JNI signature level has not been
+addressed.
+
+Gap 4: Behaviour-guided filtering of transferred seeds using black-box
+fingerprints has not been applied to cross-app JNI seed transfer.
+
+Gap 5: Fuzzing budget allocation across harness populations — as opposed to
+input queues within a single campaign — has not been studied for the
+Android JNI setting.
+
+Gap 6: Crash triage for stripped Android native libraries must work without
+symbol information. Lightweight text-based normalisation has not been
+integrated into an automated JNI fuzzing pipeline.
+
+
+2.10 Summary
+================================================================================
+
+This chapter reviewed related work in Android security analysis, JNI
+analysis, fuzz testing, static analysis, seed management, budget scheduling,
+and crash triage. Existing approaches address parts of the problem, but no
+existing system combines automated JNI entry-point extraction, harness
+generation, cross-app seed transfer, behaviour-guided admission, adaptive
+harness scheduling, and integrated crash triage into a single pipeline. The
+identified gaps motivate the design of the framework presented in this
+thesis.
+
+Key references for this chapter:
+  [1] Arzt et al., FlowDroid, PLDI 2014.
+  [2] Vallée-Rai et al., Soot, CASCON 1999.
+  [3] Fioraldi et al., AFL++, WOOT 2020.
+  [4] Manès et al., Fuzzing Survey, IEEE TSE 2021.
+  [5] Klees et al., Evaluating Fuzz Testing, CCS 2018.
+  [6] Bohme et al., AFLGo, CCS 2017.
+  [7] Borzacchiello et al., JuCify, ICSE 2022.
+  [8] Felt et al., Android Permissions, SOUPS 2012.
+  [9] Arp et al., Drebin, NDSS 2014.
+  [10] Lyu et al., MOpt, USENIX Security 2019.
+
+================================================================================
+END OF CHAPTER 2
+================================================================================

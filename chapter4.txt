@@ -1,0 +1,609 @@
+================================================================================
+CHAPTER 4 — METHODOLOGY AND SYSTEM DESIGN
+================================================================================
+
+
+4.1 Overview
+================================================================================
+
+This chapter presents the methodology and architecture of the proposed
+automated JNI fuzzing framework. The framework takes a set of Android APK
+files as input and produces, for each application, a population of C++
+fuzzing harnesses, structured seed files, and a fuzzing work queue. It then
+applies four novel techniques — cross-app seed transfer, coverage-guided seed
+admission, adaptive harness budgeting, and integrated crash triage — to
+improve fuzzing effectiveness and result interpretability.
+
+Figure 4.1 shows the high-level architecture of the framework.
+
+    +------------------+
+    |   APK Files      |
+    +--------+---------+
+             |
+             v
+    +------------------+      Stage A: DEX Analysis (jadx)
+    |  Static Analysis  |      Stage B: Argument Constraints (FlowDroid)
+    |  Pipeline         |      Stage C: Call-Sequence Analysis (Soot)
+    +--------+---------+
+             |
+             v
+    +------------------+      For each (function, strategy) pair:
+    |  Harness         |      Generates C++ harness + seeds
+    |  Generation      |
+    +--------+---------+
+             |
+             v
+    +------------------+
+    |   fuzz.db        |      SQLite work queue: (app, harness_name)
+    +--------+---------+
+             |
+    +--------+--------+--------+
+    |        |        |        |
+    v        v        v        v
+  N1a      N1b      N2       N3
+  Naive   Covg-   Adaptive  Crash
+  Seed    Guided  Top-K     Triage
+  Xfer    Admit.  Budget
+
+Figure 4.1: High-level system architecture.
+
+The framework operates in a Docker container built on a Debian-based Linux
+image. All components are written in Python 3, with the harness skeleton
+written in C++ and compiled with clang. The static analysis tools (jadx,
+Soot, FlowDroid) run inside the container using an OpenJDK runtime.
+
+
+4.2 System Inputs and Outputs
+================================================================================
+
+4.2.1 Inputs
+
+  - apks.txt: A text file containing one Android application package name
+    per line. The corresponding APK file must be present at:
+    target_APK/<package_name>/<package_name>.apk
+
+  - HARNESS_GEN_FLAGS: A set of flags that control which harness strategy
+    variants are generated. The four strategies are described in Section 4.4.
+
+4.2.2 Outputs
+
+  - target_APK/<app>/static_analysis/: Static analysis results for the app.
+    - native_functions.json: JNI native method declarations.
+    - ARG_<app>.json: Argument constraints per function.
+    - CS_<app>.json: Call-sequence records per function.
+    - signatures_pattern.txt, signatures_pattern_soot.txt,
+      signatures_libraries_offsets.txt: Extracted signatures and offset info.
+
+  - target_APK/<app>/harness_generation_callsequences.json: Merged input
+    for the harness generator.
+
+  - target_APK/<app>/fuzz/<harness_name>/: One directory per harness variant.
+    - harness.cpp: The generated harness source.
+    - harness_debug.cpp: A debug version printing argument values.
+    - seeds/: Initial seed files.
+    - seed_constraints.json: Argument type and constraint metadata.
+
+  - fuzzing/fuzz.db: SQLite database of registered harnesses.
+
+  - results/seed_pool.json: Cross-app seed pool for N1a and N1b.
+
+  - results/: All experimental results including eval CSVs, triage CSVs,
+    and scheduling reports.
+
+
+4.3 Stage A: Static Analysis Pipeline
+================================================================================
+
+The static analysis pipeline consists of three sub-stages that operate on
+the DEX bytecode and native libraries of each APK.
+
+4.3.1 Sub-Stage A1: JNI Entry-Point Extraction (jadx)
+
+The first sub-stage uses jadx to decompile the APK's DEX bytecode to Java
+source. The output is scanned for class members declared with the `native`
+modifier. For each native method the following information is recorded:
+  - Fully qualified class name.
+  - Method name.
+  - Return type.
+  - List of parameter types.
+  - Whether the method is static or instance.
+
+The result is stored in `static_analysis/native_functions.json`.
+
+Rationale: jadx provides accurate Java-level type information from DEX
+bytecode without requiring source code. The native modifier is a standard
+Java/DEX flag that is preserved in all standard APKs.
+
+4.3.2 Sub-Stage A2: Argument Constraint Extraction (FlowDroid)
+
+The second sub-stage analyses data flow from Android lifecycle entry points
+to each native method call site. For each parameter of each native method,
+it records:
+  - Whether the parameter receives a constant string value.
+  - Integer ranges if bounds can be inferred from comparisons.
+  - Null/non-null status.
+  - Length relationships between byte array and integer length parameters.
+
+The result is stored in `static_analysis/ARG_<app>.json`.
+
+Rationale: Argument constraints allow the harness generator and seed
+generator to produce more realistic inputs. A constant string argument, for
+example, should be initialised to the known constant rather than random bytes,
+increasing the probability of the target function reaching interesting code.
+
+4.3.3 Sub-Stage A3: Call-Sequence Extraction (Soot)
+
+The third sub-stage uses Soot to build the application's call graph and
+traverse it to find, for each native method, the set of callers and the
+Java-side operations performed immediately before the call. These operations
+include:
+  - Object creation (new statements).
+  - Method invocations (initializers, setters).
+  - Field writes.
+  - Constant assignments to variables later passed as arguments.
+
+The result is stored in `static_analysis/CS_<app>.json`.
+
+Rationale: Many JNI functions expect the calling Java environment to be in
+a specific state (e.g., a particular object to exist, a file to be opened).
+Call-sequence-aware harnesses reproduce a subset of this setup, making the
+harness more representative of real-world usage and increasing the chance
+that the native function body is reached without early exits.
+
+4.3.4 Merge Step
+
+After the three sub-stages complete, the results are merged into a single
+file `harness_generation_callsequences.json` that the harness generator reads.
+This file contains, for each native function: its signature, argument
+constraints (from A2), and call-site sequences (from A3).
+
+4.3.5 Memory and Performance Considerations
+
+Soot's call-graph analysis is the most resource-intensive step. For large
+applications with thousands of classes, the JVM can run out of heap memory.
+The JVM heap is set to 16 GB (`-Xmx16g`) and the stack to 64 MB (`-Xss64m`)
+before running Soot. For apps where Soot OOMs despite this limit, only the
+basic signature information from jadx is used and call-sequence harnesses are
+not generated for those apps. This limitation is documented as a constraint
+of the current implementation.
+
+
+4.4 Stage B: Harness Generation
+================================================================================
+
+The harness generator reads `harness_generation_callsequences.json` and
+produces C++ harness files for each JNI function, using one or more strategy
+variants.
+
+4.4.1 The Harness Skeleton
+
+The harness skeleton is a C++ template file (`harness/cpp/harness_skeleton.cpp`)
+containing `GENERATOR_*` placeholder tokens. The generator substitutes these
+tokens with function-specific values to produce a complete harness. The key
+placeholders are:
+
+  GENERATOR_LIB_PATH      -> absolute path to the target .so library.
+  GENERATOR_FUNC_SYMBOL   -> the JNI function symbol name.
+  GENERATOR_FUNC_SIG      -> the JNI descriptor string.
+  GENERATOR_ARGS_SETUP    -> argument parsing and variable declarations.
+  GENERATOR_FUNC_CALL     -> the actual invocation of the target function.
+  GENERATOR_CLEANUP       -> JNI cleanup code.
+  GENERATOR_INCLUDES      -> additional #include directives.
+
+4.4.2 Argument Parsing Logic
+
+The harness reads its input from a file path passed as `argv[1]`. The
+file is read into a buffer. The parser then sequentially reads each
+argument from the buffer:
+
+  - jint, jlong, jboolean, jbyte, jshort, jfloat, jdouble: Read the
+    corresponding number of bytes directly.
+  - jstring: Read a 4-byte length prefix, then that many bytes as a
+    UTF-8 string, then call `env->NewStringUTF`.
+  - jbyteArray: Read a 4-byte length prefix, then that many bytes,
+    then call `env->NewByteArray` and `env->SetByteArrayRegion`.
+  - jintArray: Similar pattern for int arrays.
+
+If the buffer is too short to supply a value, a safe default is used
+(zero, empty string, empty array), ensuring the harness never crashes in
+the parsing phase due to a short input.
+
+4.4.3 Strategy Variants
+
+The generator produces up to four harness variants per function, controlled
+by flags:
+
+  @@0 (Basic variant, flag: none)
+    Arguments are parsed purely from the fuzz input. No constraint or
+    call-sequence information is used. This is the most conservative variant
+    and serves as the baseline.
+
+  @arg@N (Argument-constrained variant, flag: -ct_argval)
+    Argument parsing is modified for parameters that have known constraints.
+    Known constant strings are hard-coded. Integer parameters with known
+    ranges have their values clamped. This makes the harness more likely to
+    satisfy input validation guards in the target function.
+
+  @cs@N (Call-sequence variant, flag: -cs_ph)
+    The harness includes a Java object setup phase before calling the target
+    function. The `JNIEnv` is set up using a mock environment, and the
+    pre-call operations identified by Soot are reproduced in the harness.
+    The call-sequence number N identifies which of the K recorded call sites
+    is used.
+
+  @arg-cs@N (Combined variant, flag: -fuzz)
+    A variant that combines both argument constraints and call-sequence setup.
+    This is the most sophisticated variant and has the highest chance of
+    reaching interesting code, but also the highest probability of failing
+    setup due to missing Java-side dependencies.
+
+4.4.4 Mock JNIEnv
+
+The harness generator includes a lightweight mock JNIEnv implementation that
+provides the minimum JNI function table needed to run the harness without the
+full Android Runtime. This mock handles:
+  - NewStringUTF, GetStringUTFChars, ReleaseStringUTFChars.
+  - NewByteArray, GetByteArrayElements, ReleaseByteArrayElements.
+  - FindClass, GetMethodID, GetStaticMethodID.
+  - CallVoidMethod, CallIntMethod, CallObjectMethod.
+
+Functions that are not implemented are stubbed with a null return or a
+no-op. This allows harnesses to compile and run even without a full JVM,
+though functions that require genuine Java object manipulation may abort.
+
+4.4.5 Output Structure
+
+For each (function, strategy, call-site-index) combination, the generator
+creates a directory:
+
+    target_APK/<app>/fuzz/<harness_name>/
+
+where harness_name encodes the function name and variant. The directory
+contains:
+  - harness.cpp
+  - harness_debug.cpp
+  - seeds/ (initial seeds from seed_generator.py)
+  - seed_constraints.json (argument type metadata)
+
+4.4.6 Seed Generation
+
+After generating the harness, the seed generator (`harness/seed_generator.py`)
+reads `seed_constraints.json` and writes initial seed files to the `seeds/`
+directory. For each argument type it writes a valid default value using the
+same binary format that the harness parser expects:
+  - Integers: 4 bytes of zeros.
+  - Strings: 4-byte length prefix (4) + "test" (4 bytes).
+  - Byte arrays: 4-byte length prefix (8) + 8 zero bytes.
+
+Multiple seed variants are generated to provide initial corpus diversity.
+
+
+4.5 Stage C: Fuzzing Work Queue
+================================================================================
+
+After harness generation, the fuzzing work queue is populated by scanning
+all harness directories and inserting (app, harness_name) pairs into the
+SQLite database `fuzzing/fuzz.db`.
+
+4.5.1 Database Schema
+
+    CREATE TABLE IF NOT EXISTS fuzzdata (
+        app   TEXT NOT NULL,
+        fname TEXT NOT NULL,
+        PRIMARY KEY (app, fname)
+    );
+
+The primary key ensures that duplicate registrations are silently ignored.
+
+4.5.2 Purpose
+
+The database decouples harness generation from fuzzing execution. Once
+registered, a harness can be picked up by any component that queries the
+database. This allows:
+  - The eval harness scheduler to list all available harnesses.
+  - The coverage-guided transfer tool to iterate over all harnesses.
+  - The adaptive scheduler to pilot-fuzz harnesses from the queue.
+  - Multiple workers to dequeue harnesses concurrently (future work).
+
+4.5.3 Verification
+
+After building the queue, its contents can be verified with:
+
+    python3 -c "import sqlite3; c=sqlite3.connect('fuzzing/fuzz.db').cursor();
+    c.execute('SELECT app,count(*) FROM fuzzdata GROUP BY app'); print(c.fetchall())"
+
+
+4.6 Novelty N1a: Cross-App JNI Seed Transfer
+================================================================================
+
+4.6.1 Motivation
+
+Seeds developed for one application's harness may be useful for a different
+application's harness if both harnesses accept the same argument structure.
+This is the case when two JNI functions share the same parameter list at the
+JNI type level, which means the harness parsers produce the same argument
+structure from any given input buffer.
+
+4.6.2 Seed Pool Construction
+
+The tool `tools/build_seed_pool.py` scans all registered harnesses and
+extracts the JNI type signature of each harness from its `seed_constraints.json`.
+It builds a dictionary mapping each unique signature string to the list of
+harnesses that share that signature. For each harness, all seeds from its
+`seeds/` directory are indexed.
+
+The result is stored in `results/seed_pool.json`.
+
+4.6.3 Transfer Mechanism
+
+The tool `tools/apply_seed_transfer.py` reads the seed pool and, for each
+harness H, identifies all other harnesses H' ≠ H in the pool that share the
+same signature. Seeds from H' are copied to a transfer directory for H.
+
+The transfer directory is `target_APK/<app>/fuzz/<harness>/seeds_transferred/`.
+
+The fuzzer is then invoked with both the local seeds and the transferred seeds
+as the initial corpus.
+
+4.6.4 Correctness Guarantee
+
+Because the seed transfer is performed only between harnesses with identical
+JNI type signatures, the transferred seed bytes will be parsed by the
+receiving harness's parser in exactly the same way as by the source harness's
+parser. The seed will produce valid argument values. This is a structural
+guarantee that does not require semantic similarity between the two
+applications.
+
+4.6.5 Evaluation Protocol
+
+Evaluation compares two configurations under the same total time budget:
+  - Baseline: each harness is fuzzed with only its local seeds.
+  - N1a Transfer: each harness is fuzzed with local + transferred seeds.
+
+Metrics collected: unique edge count (or execution count in degraded mode),
+crash count, and total executions.
+
+
+4.7 Novelty N1b: Coverage-Guided Seed Admission
+================================================================================
+
+4.7.1 Limitation of Naive Transfer
+
+Naive seed transfer can introduce seeds that produce the same behaviour as
+seeds already in the local corpus. Adding these seeds enlarges the corpus
+without increasing behavioral diversity, potentially slowing the fuzzer.
+
+4.7.2 Behavior Fingerprint
+
+A behavior fingerprint F(s, h) for seed s and harness h is defined as a
+tuple:
+  (signal, time_bucket, stdout_size_bucket, stderr_size_bucket,
+   normalised_stderr_prefix)
+
+where:
+  - signal is the process termination signal (e.g., 0 for clean exit,
+    SIGABRT, SIGSEGV).
+  - time_bucket is the execution duration rounded to the nearest 100 ms.
+  - stdout_size_bucket and stderr_size_bucket are the output sizes rounded
+    to the nearest 512 bytes.
+  - normalised_stderr_prefix is the first 3 non-empty lines of stderr after
+    replacing hex addresses, numbers, and thread IDs with tokens.
+
+4.7.3 Admission Protocol
+
+The tool `tools/coverage_guided_transfer.py` maintains a per-harness set of
+observed fingerprints, initially populated by running each local seed through
+the harness. A candidate transferred seed is admitted to the corpus if and
+only if its fingerprint is not already in the observed set. Admitted seeds
+are added to the `seeds_transferred_cg/` directory.
+
+4.7.4 Algorithm
+
+    Algorithm: Coverage-Guided Seed Admission
+    Input:  Harness H, local seeds S_local, candidate seeds S_cand
+    Output: Admitted seeds S_admit
+
+    S_admit := {}
+    observed := {}
+    for s in S_local:
+        f := run_harness(H, s); observed.add(fingerprint(f))
+    for s in S_cand:
+        f := run_harness(H, s)
+        fp := fingerprint(f)
+        if fp not in observed:
+            S_admit.add(s)
+            observed.add(fp)
+    return S_admit
+
+4.7.5 Relationship to Coverage-Guided Fuzzing
+
+The admission protocol uses execution behavior as a proxy for the coverage
+information that a real coverage-guided fuzzer tracks via instrumentation.
+Because the harnesses in degraded mode may not produce reliable edge-coverage
+bitmaps (due to the missing Android Runtime), behavior fingerprinting provides
+an instrumentation-free alternative that can still filter redundant seeds.
+
+
+4.8 Novelty N2: Adaptive Top-K Harness Budgeting
+================================================================================
+
+4.8.1 Problem Formulation
+
+Given B harnesses and a total time budget T, the budget-allocation problem
+is: choose a subset of harnesses and a time allocation for each such that
+the total fuzzing yield (crashes, executions) is maximised.
+
+The naive solution is to run each harness for T/B time. This is the baseline.
+
+The adaptive approach uses a two-phase strategy:
+  Phase 1 (Pilot): Run each harness for a short duration t_pilot.
+  Phase 2 (Main): Score all harnesses, select the top-K by score, and run
+                  each for (T - B * t_pilot) / K time.
+
+4.8.2 Scoring Function
+
+The score for harness h after its pilot run is:
+
+    score(h) = w_c * crash_count(h)
+             + w_e * (executions(h) / t_pilot)
+             + w_s * stability_flag(h)
+
+where:
+  - crash_count(h) is the number of crashes observed in the pilot.
+  - executions(h) / t_pilot is the execution rate (throughput).
+  - stability_flag(h) is 1 if the harness completes the pilot without
+    a parser error and 0 otherwise.
+  - w_c = 10, w_e = 1, w_s = 5 are fixed weights.
+
+4.8.3 Budget Allocation
+
+After scoring, harnesses are sorted by score descending. The top-K are
+selected for the main phase. K is configurable; the default is min(5, B).
+Each top-K harness receives an equal share of the remaining budget.
+
+4.8.4 Comparison Against Baseline
+
+The evaluation compares two configurations:
+  - Queue baseline: harnesses are run in queue order, each for T/B time,
+    for a total budget of T.
+  - Adaptive top-K: pilot phase runs all B harnesses for t_pilot each
+    (cost: B * t_pilot), then top-K harnesses run for the remaining budget.
+
+The total time spent in both configurations is held equal.
+
+4.8.5 Metrics
+
+  - Total crashes produced across the harness set.
+  - Total unique crashes (post-triage).
+  - Average execution rate across selected harnesses.
+
+
+4.9 Novelty N3: Integrated Crash Triage
+================================================================================
+
+4.9.1 Problem
+
+A fuzzing campaign produces one crash directory per harness. The total number
+of crash files can be in the thousands. A manual review of thousands of crash
+files is not feasible. Triage must reduce this volume to a manageable set of
+unique root causes.
+
+4.9.2 Normalisation Algorithm
+
+The triage tool `tools/triage_host_crashes.py` processes each crash as
+follows:
+
+  Step 1: Read the stderr log saved alongside each crash input.
+  Step 2: Normalise the log:
+    a. Replace hex addresses (0x[0-9a-fA-F]+) with <ADDR>.
+    b. Replace decimal numbers of 4+ digits with <NUM>.
+    c. Replace thread IDs in the form "Thread N" with "Thread <TID>".
+    d. Strip trailing whitespace from each line.
+    e. Remove blank lines.
+  Step 3: Take the first min(5, len) non-empty lines of the normalised log
+          as the crash signature.
+  Step 4: Prepend the termination signal to the signature string.
+
+4.9.3 Clustering
+
+Crashes with identical signatures are placed in the same cluster. A cluster
+ID is assigned sequentially (C0001, C0002, ...) in order of first occurrence.
+
+4.9.4 Output
+
+The triage tool writes a CSV file to `results/` with columns:
+  cluster, count, apps, harnesses, signature
+
+The CSV is sorted by count descending, with the most common crash cluster
+at the top.
+
+4.9.5 Compression Ratio
+
+The compression ratio is the total number of raw crashes divided by the
+number of unique clusters. A ratio of 1000 means that 1000 raw crashes
+all mapped to the same root cause (or to 1 cluster). In the degraded-mode
+experiments conducted in this thesis, the dominant cluster was
+SIGABRT | libart.so: cannot open shared object file: No such file or directory,
+reflecting the Bionic-Glibc incompatibility discussed in Section 4.10.
+
+4.9.6 Integration with N2
+
+When adaptive budgeting (N2) is used, the triage tool is automatically
+invoked at the end of the scheduling run, reading the crash directories of
+all harnesses included in the main phase. This integration allows immediate
+post-campaign analysis without manual steps.
+
+
+4.10 Runtime Compatibility and Degraded Mode
+================================================================================
+
+4.10.1 The Bionic-Glibc Incompatibility
+
+Android native libraries are compiled against Bionic, Android's C library.
+Bionic provides a compatible subset of POSIX functions but uses a different
+ABI from glibc (the standard C library on Linux desktops). In particular:
+  - Bionic's libc.so and glibc's libc.so are both shared objects named
+    libc.so but are not ABI-compatible.
+  - Android's dynamic linker (linker64 or linker) is part of the Android
+    system image and is not present on a standard Linux host.
+  - libart.so, the Android Runtime library, is linked against Bionic and
+    depends on the Android-specific linker namespace mechanism.
+
+As a consequence, loading an Android JNI library directly on a glibc-based
+Linux host will fail at dlopen time because the Bionic-linked dependencies
+cannot be resolved.
+
+4.10.2 Degraded Mode Operation
+
+To allow experiments to proceed despite this incompatibility, the framework
+supports a `--skip-preflight` flag that bypasses the runtime dependency check
+performed by `fuzzing/host_fuzz.py`. In degraded mode:
+  - The harness is compiled and linked against the glibc-based host compiler.
+  - The harness binary is executed.
+  - The execution typically terminates with SIGABRT because dlopen on
+    libart.so or the JNI library itself fails.
+  - The termination is recorded as a crash, which is then triaged by N3.
+
+Degraded mode allows the framework's harness generation, seed management,
+scheduling, and triage components to be fully exercised and validated, even
+though the underlying native function body is not reached.
+
+4.10.3 Thesis Implication
+
+The Bionic-Glibc incompatibility is the primary limitation of the current
+implementation. It prevents the framework from reporting true native-function
+vulnerabilities in the target libraries on a standard Linux host. The
+correct solution is to run the harnesses on an ARM Android device or an
+ARM Android emulator that provides the full Android Runtime. This is
+identified as future work. All experimental results in this thesis reflect
+degraded-mode operation and should be interpreted accordingly.
+
+
+4.11 Summary of the Methodology
+================================================================================
+
+This chapter described the four-stage methodology of the proposed framework:
+
+  Stage A: Static analysis of APK files to extract JNI signatures,
+           argument constraints, and call-site sequences.
+
+  Stage B: Harness generation producing C++ harnesses in four strategy
+           variants, with structured seed files.
+
+  Stage C: Work-queue population in an SQLite database that decouples
+           generation from execution.
+
+  Novelties: Four distinct contributions — cross-app seed transfer (N1a),
+             coverage-guided seed admission (N1b), adaptive top-K harness
+             budgeting (N2), and integrated crash triage (N3) — that
+             improve seed quality, budget utilisation, and result
+             interpretability.
+
+The methodology is designed to be end-to-end automated, requiring only an
+APK file and a package name as inputs. All stages from static analysis to
+triage are orchestrated by shell scripts and Python drivers, with minimal
+manual intervention.
+
+================================================================================
+END OF CHAPTER 4
+================================================================================

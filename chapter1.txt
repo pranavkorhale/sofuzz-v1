@@ -1,0 +1,485 @@
+================================================================================
+CHAPTER 1 — INTRODUCTION
+Automated JNI Fuzzing of Android Native Libraries
+================================================================================
+
+Author  : Pranav Namdeo Korhale
+Roll No : 2024PCS0126
+Program : M.Tech Computer Science, IIT Jammu
+Guide   : Dr. Manoj Singh Gaur
+================================================================================
+
+
+1.1 Background
+================================================================================
+
+The rapid growth of mobile computing has made Android one of the most
+widely deployed operating systems in the world. Billions of devices run
+Android across smartphones, tablets, smart TVs, automotive platforms, and
+embedded systems. Android applications are developed primarily in Java or
+Kotlin and executed inside the Android Runtime (ART), which provides
+memory management, garbage collection, bytecode interpretation, and
+just-in-time compilation. ART is designed to enforce managed execution,
+which reduces the likelihood of certain categories of programming errors,
+such as dangling pointers, buffer overruns, and unhandled null dereferences.
+
+Despite this managed environment at the Java layer, modern Android
+applications are rarely pure Java programs. Performance-critical
+operations, hardware integration, cryptographic routines, media encoding
+and decoding, compression and decompression, game-engine rendering, digital
+rights management, anti-tampering mechanisms, and code obfuscation often
+require the use of native C or C++ code. Android supports this through the
+Android Native Development Kit (NDK) and the Java Native Interface (JNI).
+The JNI standard defines a protocol through which managed Java code and
+unmanaged native C/C++ code can call each other across language boundaries.
+
+Native code in Android applications is typically compiled into shared object
+files with the `.so` extension. These files are packaged inside the APK
+alongside the Java/DEX bytecode. When a Java method is declared with the
+`native` keyword, the Android Runtime resolves the corresponding native
+implementation by loading the appropriate `.so` file and locating the
+correct symbol either by JNI naming convention or by dynamic registration
+through `JNI_OnLoad`.
+
+The native layer of Android applications is important from a security
+standpoint. Unlike the managed Java layer, C and C++ code is not protected
+by runtime memory safety. A single programming error can cause a buffer
+overflow, integer overflow, use-after-free, null pointer dereference, stack
+overflow, or unaligned memory access. Such errors are directly exploitable
+at the native level and can lead to arbitrary code execution, data
+corruption, application crashes, or information leakage.
+
+Analysing and testing Android native libraries is significantly more
+difficult than testing Java-layer logic. Native libraries are commonly
+distributed as stripped binaries without source code, symbol information,
+or debugging metadata. This makes manual review and automatic analysis
+difficult. Additionally, JNI functions are tightly bound to their calling
+environment and cannot be invoked in isolation without a harness that
+prepares the correct JNI execution context, argument types, and runtime
+conditions.
+
+This creates a fundamental challenge for security testers: traditional
+static analysis tools focus on the Java/DEX layer, and traditional native
+fuzzers cannot easily target JNI entry points. The native layer therefore
+represents a significant blind spot in Android application security testing.
+
+Fuzz testing, commonly referred to as fuzzing, is a software testing
+technique that automatically generates or mutates inputs and feeds them to
+a target program to discover crashes, hangs, or unexpected behaviour.
+Fuzzing has proven highly effective in finding memory-safety vulnerabilities
+in native programs. Tools such as AFL, AFL++, libFuzzer, and Honggfuzz have
+discovered thousands of real-world vulnerabilities. However, these tools
+are designed for programs with standard input interfaces and cannot
+directly target JNI functions embedded inside Android applications.
+
+To fuzz an Android JNI function, a testing harness must first be created.
+This harness must load the target native library, establish a valid JNI
+environment, prepare the required JNI argument types, and invoke the target
+function with a series of mutated inputs. Writing such harnesses manually
+for each native function in each application is impractical at scale. A
+single APK can contain dozens to hundreds of native entry points, and a
+realistic evaluation may require testing many APKs.
+
+This thesis addresses this challenge by designing and implementing an
+automated framework that takes an Android APK as input and produces a
+collection of JNI-aware fuzzing harnesses, structured seed inputs, and a
+full fuzzing and triage pipeline — without manual reverse engineering.
+
+
+1.2 Motivation
+================================================================================
+
+The security importance of the native layer in Android applications has
+been widely acknowledged, yet systematic automated testing of this layer
+remains limited in practice. Several factors motivate the research
+presented in this thesis.
+
+1.2.1 Native Code Is Prevalent and Security-Critical
+
+Major Android applications from trusted companies include substantial
+amounts of native code. Web browsers include native parsers, layout
+engines, and JavaScript interpreters. Messaging applications use native
+cryptographic libraries for end-to-end encryption. Social media applications
+include native image and video processing. Mobile banking applications use
+native modules for certificate pinning, tamper detection, and token
+management. Navigation applications use native rendering engines. Games
+include native physics and graphics engines.
+
+This native code handles sensitive operations and is directly reachable
+from untrusted input. A vulnerability in a native parser, for example,
+could allow an attacker to craft a malicious media file or network packet
+that triggers arbitrary code execution. The importance of these functions
+makes testing them a security priority.
+
+1.2.2 Existing Tooling Does Not Reach the Native Layer
+
+Most existing Android security analysis tools focus on the Java or DEX
+layer. They examine permissions, API calls, information flow, privacy
+leaks, and Java bytecode for known vulnerability patterns. While this
+analysis is valuable, it does not test the correctness or safety of native
+code execution.
+
+Some general-purpose native fuzzers exist, but they require standalone
+programs with file or stdin input interfaces. JNI functions do not match
+this model. They are exported from shared libraries, take JNI-typed
+arguments, and require a correct runtime environment to execute at all.
+Applying a standard native fuzzer to a JNI function requires a custom
+harness, which is non-trivial to write.
+
+1.2.3 Manual Harness Writing Does Not Scale
+
+For a research or security team to manually reverse-engineer an application,
+identify its native entry points, understand the expected argument types
+and ranges, write appropriate JNI harnesses, and test each one individually
+requires significant effort per application. At a single-function level, this
+might take several hours. Across hundreds of functions and dozens of
+applications, this is not a practical approach.
+
+Automation is therefore the only viable path to systematic JNI fuzzing at
+scale. An automated pipeline that extracts native entry points, infers
+argument information, generates harnesses, and runs fuzzing can dramatically
+reduce the manual effort required.
+
+1.2.4 Seed Quality Determines Fuzzing Depth
+
+Random byte inputs rarely satisfy the structured format expected by JNI
+function parsers. A function that expects a length-prefixed byte array
+followed by an integer mode flag will reject most random byte strings before
+they reach the target logic. This means the fuzzer spends most of its
+execution quota on shallow failures rather than exercising deep code paths.
+
+High-quality structured seeds that respect the JNI argument types and
+constraints are essential for effective fuzzing. Moreover, generating such
+seeds independently for every harness in every application wastes effort.
+If a seed that works well for a function in one application can be reused
+by a compatible function in another application, that reduces the cold-start
+problem and improves coverage faster.
+
+1.2.5 Budget Allocation Is Inefficient Without Signal
+
+When many harnesses are available, assigning the same fuzzing time to each
+one is inefficient. Some harnesses may immediately show productive
+behaviour, producing crashes and covering many paths within the first few
+seconds. Others may be shallow or structurally constrained and show very
+little variation regardless of how long they are fuzzed. Spending equal
+time on both types of harnesses wastes the available compute budget.
+
+A method for estimating the relative productivity of harnesses and
+allocating more time to the most promising ones can improve overall
+fuzzing effectiveness without increasing the total time budget.
+
+1.2.6 Crash Reports Are Noisy Without Triage
+
+When fuzzing generates many crash files, the apparent number of findings
+is often much larger than the number of unique underlying bugs. Memory
+addresses, thread identifiers, temporary paths, and large numeric values
+vary across executions even when the root cause is identical. Without a
+deduplication and normalisation step, it is easy to report thousands of
+crashes when only a handful of unique defect signatures are present.
+
+A lightweight crash triage mechanism that normalises noisy values and
+groups similar crashes into clusters allows results to be interpreted
+accurately, distinguishing real unique findings from repeated instances
+of the same issue.
+
+Together, these factors motivate the design of the automated JNI fuzzing
+framework presented in this thesis.
+
+
+1.3 Problem Statement
+================================================================================
+
+Android applications increasingly rely on native C/C++ libraries accessed
+through the Java Native Interface (JNI). These native libraries often
+contain performance-critical and security-sensitive functionality, but they
+are commonly distributed as stripped `.so` binaries without source code or
+debugging symbols. As a result, identifying native entry points,
+understanding their expected arguments, and testing them systematically
+becomes difficult.
+
+Traditional fuzzing tools cannot directly test JNI functions because such
+functions are not standalone programs. Each native function requires a
+suitable harness that can load the target library, prepare the JNI
+environment, convert raw input bytes into valid JNI arguments, and invoke
+the function in a meaningful context. Creating such harnesses manually for
+every native method is time-consuming and does not scale across large
+Android applications or multiple APKs.
+
+Another major challenge is input validity. Random byte-level fuzzing often
+fails before reaching useful native logic because JNI functions expect
+structured arguments such as strings, byte arrays, integer ranges, object
+references, and length-dependent buffers. Without valid seed inputs and
+argument-aware parsing, most executions are wasted on shallow failures. In
+addition, a single application can generate many harnesses, but fuzzing all
+of them uniformly wastes time because only a subset may be productive.
+
+Crash analysis also remains a challenge. Fuzzing can generate thousands of
+crash logs, but many of them may represent the same underlying root cause.
+Differences in memory addresses, thread identifiers, file paths, and
+numeric values can make duplicate crashes appear unique. Therefore, relying
+only on raw crash counts can lead to misleading conclusions.
+
+Hence, the core problem addressed in this thesis is the lack of an
+automated, scalable, and systematic approach for fuzzing Android native
+libraries through JNI. There is a need for a framework that can
+automatically extract native entry points from APKs, generate JNI-aware
+harnesses, create and reuse structured seed inputs, allocate fuzzing budget
+intelligently across generated harnesses, and cluster crash outputs into
+meaningful unique signatures.
+
+
+1.4 Objectives
+================================================================================
+
+The main objective of this thesis is to design and implement an automated
+framework for fuzzing Android native libraries through JNI. The work aims
+to reduce manual reverse engineering effort and provide a systematic
+workflow from APK analysis to harness generation, seed preparation, fuzz
+execution, scheduling, and crash triage.
+
+The specific objectives are as follows:
+
+Objective 1 — Automated extraction of JNI entry points from Android APKs.
+    The framework should analyse the Java/DEX layer of an APK and identify
+    native methods, JNI signatures, return types, argument types, and their
+    relationship with the Java-side code. This should require no manual
+    intervention and should handle both standard JNI naming and dynamic
+    registration.
+
+Objective 2 — Inference of argument and call-site context for native functions.
+    The system should collect information such as constants, argument
+    constraints, buffer-length relations, and Java-side call sequences so
+    that native functions can be invoked in a more realistic manner. This
+    includes inter-procedural data-flow analysis and call-graph construction.
+
+Objective 3 — Automatic generation of JNI-aware fuzzing harnesses.
+    The framework should create compilable C++ harnesses for native
+    functions without manual wrapper writing. Each harness should be able
+    to load the native library, parse input bytes into JNI-compatible
+    arguments, and call the target function. Multiple harness variants
+    should be generated depending on what static information is available.
+
+Objective 4 — Structured seed generation for JNI arguments.
+    The system should create initial seed files based on JNI argument types
+    and recovered constraints, so that the fuzzer starts with inputs that
+    are more likely to pass the harness parser and reach the target native
+    function.
+
+Objective 5 — Cross-app seed transfer based on JNI signature compatibility.
+    The framework should reuse seeds between harnesses of different
+    applications when their JNI signatures are compatible. This allows
+    structured inputs from one app to improve fuzzing of another app's
+    native functions and reduces cold-start behaviour.
+
+Objective 6 — Behaviour-guided seed admission.
+    The system should avoid blindly adding all transferred seeds by probing
+    candidate seeds and keeping only those that produce new observable
+    behaviour on the target harness. A black-box behaviour fingerprint
+    should be used to judge whether a transferred seed is useful.
+
+Objective 7 — Adaptive top-K harness budgeting.
+    The framework should perform short pilot runs, score candidate harnesses
+    based on execution behaviour, and assign the main fuzzing budget to the
+    top-K most promising harnesses instead of treating all harnesses
+    uniformly. This should improve fuzzing efficiency under a limited
+    time budget.
+
+Objective 8 — Integrated crash triage and deduplication.
+    The system should normalise crash logs, remove noisy details such as
+    addresses and thread identifiers, and group similar crashes into unique
+    clusters so that results are not inflated by duplicate crash files.
+    Every reported crash count should be accompanied by a unique-cluster
+    count.
+
+Objective 9 — Reproducible result collection and reporting.
+    The framework should collect outputs from seed transfer, fuzzing,
+    adaptive scheduling, and crash triage into structured files that can be
+    inspected, compared, and used for thesis evaluation consistently.
+
+
+1.5 Scope
+================================================================================
+
+The scope of this thesis is limited to the design and implementation of an
+automated fuzzing framework for Android native libraries accessed through
+JNI. The work focuses on analysing APK files, identifying native entry
+points, generating JNI-aware harnesses, preparing structured seed inputs,
+executing fuzzing experiments, and processing crash outputs.
+
+The framework operates at the application level. It takes Android APKs as
+input and analyses their Java/DEX bytecode to discover native methods and
+related call-site information. Based on this information, it generates C++
+harnesses for JNI functions and prepares seed inputs according to the
+recovered argument types and constraints. The scope includes both basic
+harness generation and enhanced harness variants that use argument
+constraints and call-sequence context.
+
+This work also covers seed-management techniques for improving fuzzing
+effectiveness. It includes cross-app seed transfer, where seeds are reused
+between harnesses with compatible JNI signatures, and behaviour-guided seed
+admission, where transferred seeds are filtered based on their observable
+behaviour on the target harness.
+
+The thesis further includes adaptive fuzzing-budget allocation across
+generated harnesses. Instead of assigning equal time to all harnesses, the
+framework performs pilot executions, scores harnesses using execution
+behaviour, and selects the top-K harnesses for longer fuzzing.
+
+Crash processing is also within scope. The framework collects crash logs
+generated during fuzzing, normalises noisy values, and clusters similar
+crashes into unique signatures.
+
+The scope does not include manual reverse engineering of native binaries,
+manual vulnerability confirmation, source-level patch generation, or
+production security disclosures. Confirming whether a crash is exploitable,
+assigning a CVSS severity score, and producing public security advisories
+are considered outside the primary scope of this thesis.
+
+The implementation and evaluation are performed in a host-side experimental
+environment. Android runtime dependency issues, such as the compatibility
+gap between Android Bionic libraries and the standard Linux glibc
+environment, are treated as an implementation limitation and are documented
+separately. The focus of the thesis is on the automation, seed-transfer,
+scheduling, and triage methodology rather than on confirmed real-world
+vulnerability counts.
+
+
+1.6 Contributions
+================================================================================
+
+This thesis makes the following contributions toward automated fuzzing of
+Android native libraries through JNI.
+
+Contribution 1 — End-to-end JNI fuzzing pipeline for Android APKs.
+    The thesis presents a complete workflow that starts from an Android APK
+    and proceeds through static analysis, native entry-point extraction,
+    harness generation, seed preparation, fuzz execution, result collection,
+    and crash triage. The pipeline reduces the need for manually identifying
+    native methods and manually writing JNI harnesses.
+
+Contribution 2 — Automatic extraction of JNI signatures and call-site context.
+    The framework analyses the Java/DEX layer of an APK to identify native
+    methods, recover JNI signatures, infer argument-related information, and
+    extract call-sequence context from Java-side call sites. This information
+    is used to generate more realistic harnesses and structured seeds.
+
+Contribution 3 — Automatic generation of JNI-aware fuzzing harnesses.
+    The system generates C++ harnesses for native functions automatically.
+    Each harness wraps a native entry point, parses raw input bytes into
+    JNI-compatible arguments, loads the target native library, and invokes
+    the function. Multiple harness variants are generated depending on
+    whether only the function signature, argument constraints, call-sequence
+    context, or both are available.
+
+Contribution 4 — Structured seed generation for JNI arguments.
+    The thesis implements seed generation based on JNI argument types and
+    recovered constraints. Instead of relying only on random byte inputs,
+    the framework creates seed files that are more likely to satisfy the
+    harness parser and reach the target native function.
+
+Contribution 5 — Cross-app seed transfer based on JNI signature compatibility.
+    A seed-pool mechanism is introduced to reuse seeds across different
+    Android applications. Harnesses with compatible JNI signatures are
+    grouped, and seeds from one app can be transferred to another app's
+    harness when their argument structure matches.
+
+Contribution 6 — Behaviour-guided seed admission.
+    The framework improves seed transfer by probing candidate transferred
+    seeds and accepting only those that produce new observable behaviour on
+    the target harness. This prevents the transferred corpus from being
+    inflated with redundant seeds and creates a smaller, more useful set.
+
+Contribution 7 — Adaptive top-K harness budgeting.
+    The thesis introduces an adaptive scheduling method for fuzzing generated
+    harnesses. Short pilot runs are used to score candidate harnesses based
+    on crashes, execution throughput, and parser stability. The main fuzzing
+    budget is then allocated to the top-K most promising harnesses instead
+    of treating all harnesses uniformly.
+
+Contribution 8 — Integrated crash triage and deduplication.
+    The framework includes automated crash triage that normalises noisy
+    crash-log details such as memory addresses, thread identifiers, temporary
+    paths, and large numeric values. Similar crashes are grouped into
+    clusters, allowing results to be reported as unique crash signatures
+    rather than raw crash-file counts.
+
+Contribution 9 — Reproducible result aggregation for evaluation.
+    The system collects outputs from seed transfer, adaptive scheduling,
+    fuzzing, and triage into structured CSV and JSON summaries. This makes
+    the evaluation reproducible and allows the results to be inspected,
+    compared, and presented consistently.
+
+
+1.7 Thesis Organization
+================================================================================
+
+The remainder of this thesis is organised into the following chapters.
+
+Chapter 2 — Literature Survey
+
+    This chapter reviews existing research on Android security analysis,
+    JNI and native code testing, static program analysis, fuzz testing,
+    seed management, fuzzing budget allocation, and crash triage. It
+    discusses the current state of the art in each area, identifies gaps
+    in existing approaches, and explains how this thesis addresses those
+    gaps.
+
+Chapter 3 — Background and Preliminaries
+
+    This chapter introduces the technical concepts that underpin the
+    framework. It explains the structure of Android APK files, the role of
+    DEX bytecode, the Java Native Interface, shared native libraries, the
+    Android Runtime, JNI argument types, static analysis tools used in this
+    work (DEX decompilation, inter-procedural data-flow analysis, call-graph
+    construction), fuzzing principles, structured seed generation, and crash
+    triage basics.
+
+Chapter 4 — Methodology and System Design
+
+    This chapter describes the design of the proposed automated JNI fuzzing
+    framework. It presents the six-stage pipeline: static DEX analysis,
+    automatic harness generation, fuzz-queue construction, cross-app seed
+    transfer with behaviour-guided admission, host-side fuzzing with adaptive
+    top-K scheduling, and integrated crash triage. The chapter explains the
+    design decisions, data structures, algorithms, and interfaces involved
+    in each stage. It also explains the four main novelties of the framework
+    and the rationale behind each.
+
+Chapter 5 — Implementation
+
+    This chapter covers the implementation details of the framework. It
+    describes the tools, programming languages, libraries, and runtime
+    environment used. It explains how each pipeline stage is implemented,
+    including the static analysis scripts, the C++ harness skeleton and
+    code-generation logic, the SQLite fuzz queue, the seed pool, the
+    behaviour-guided transfer module, the adaptive harness scheduler, and
+    the crash triage and result aggregation scripts.
+
+Chapter 6 — Experiments and Results
+
+    This chapter presents the experimental evaluation of the framework. It
+    describes the set of Android applications used, the harness counts
+    generated for each application, the cross-app seed pool statistics, the
+    results of the three-way seed-transfer comparison, the adaptive
+    scheduling results including pilot scoreboard and selected harness sets,
+    and the crash triage output including raw versus cluster counts. It also
+    discusses the current runtime limitation and its effect on the evaluation.
+
+Chapter 7 — Conclusion and Future Work
+
+    This chapter summarises the contributions of the thesis, discusses the
+    limitations of the current implementation, and outlines future research
+    directions. These include runtime-compatible fuzzing environments,
+    improved dynamic JNI registration handling, parallel and distributed
+    execution, stronger crash classification, and larger-scale evaluation
+    across more diverse applications.
+
+References
+
+    This section lists all sources cited in the thesis, including academic
+    papers, technical standards, software documentation, and online
+    references.
+
+================================================================================
+END OF CHAPTER 1
+================================================================================
